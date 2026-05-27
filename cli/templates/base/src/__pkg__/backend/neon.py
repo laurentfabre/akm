@@ -28,6 +28,9 @@ from .config import logger, settings
 
 
 def _engine_kwargs() -> dict:
+    # SSL is controlled by `sslmode` in the connection URL (Neon URLs carry
+    # `?sslmode=require`; local dev can use `?sslmode=disable`) — do not hardcode
+    # it here, or the documented local-Postgres dev path can't connect.
     return {
         # The pooler multiplexes, so keep the app-side pool small.
         "pool_size": 5,
@@ -35,7 +38,6 @@ def _engine_kwargs() -> dict:
         "pool_pre_ping": True,          # heal connections dropped by scale-to-zero
         "pool_recycle": 300,            # recycle well under Neon idle timeout
         "pool_timeout": 10,
-        "connect_args": {"sslmode": "require"},
     }
 
 
@@ -54,7 +56,7 @@ def create_direct_engine() -> Engine:
     if not url:
         raise RuntimeError("DATABASE_URL_DIRECT / DATABASE_URL is not set")
     logger.info("Creating Neon engine (direct endpoint)")
-    return create_engine(url, pool_pre_ping=True, connect_args={"sslmode": "require"})
+    return create_engine(url, pool_pre_ping=True)  # sslmode comes from the URL
 
 
 def validate_db(engine: Engine) -> None:

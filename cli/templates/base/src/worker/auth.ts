@@ -39,14 +39,14 @@ export async function authenticate(req: Request, env: Env): Promise<Identity | n
   if (!claims) return null;
 
   // Service tokens have an empty `sub`; derive a stable service principal.
-  const isService = !claims.sub || claims.sub.length === 0;
-  if (isService) {
+  const sub = typeof claims.sub === "string" ? claims.sub : "";
+  if (sub.length === 0) {
     const cn = (claims.common_name as string) || (claims.azp as string) || "unknown";
     return { sub: `svc:${cn}`, email: null, kind: "service" };
   }
   return {
-    sub: claims.sub as string,
-    email: (claims.email as string) ?? null,
+    sub,
+    email: typeof claims.email === "string" ? claims.email : null,
     kind: "user",
   };
 }
@@ -117,8 +117,8 @@ async function verifyAccessJwt(token: string, env: Env): Promise<Record<string, 
   const ok = await crypto.subtle.verify(
     "RSASSA-PKCS1-v1_5",
     key,
-    b64urlToBytes(s),
-    enc.encode(`${h}.${p}`),
+    b64urlToBytes(s) as BufferSource,
+    enc.encode(`${h}.${p}`) as BufferSource,
   );
   if (!ok) return null;
 
@@ -154,12 +154,12 @@ async function mintInternalJwt(id: Identity, env: Env): Promise<string> {
   const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
   const key = await crypto.subtle.importKey(
     "raw",
-    enc.encode(env.AKM_INTERNAL_JWT_KEY),
+    enc.encode(env.AKM_INTERNAL_JWT_KEY) as BufferSource,
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
   );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(signingInput));
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(signingInput) as BufferSource);
   return `${signingInput}.${b64urlBytes(new Uint8Array(sig))}`;
 }
 

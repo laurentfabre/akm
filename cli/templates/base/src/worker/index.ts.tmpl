@@ -9,11 +9,12 @@
 //     calling back through this Worker (none are exposed to it directly).
 import { getContainer } from "@cloudflare/containers";
 import { authenticate, sanitizeAndMint, type Env as AuthEnv } from "./auth";
+import { {{app_pkg}}Backend } from "./container";
 
-export { {{app_pkg}}Backend } from "./container";
+export { {{app_pkg}}Backend };
 
 interface Env extends AuthEnv {
-  {{app_pkg_upper}}_BACKEND: DurableObjectNamespace;
+  {{app_pkg_upper}}_BACKEND: DurableObjectNamespace<{{app_pkg}}Backend>;
   ASSETS: Fetcher;
 }
 
