@@ -101,7 +101,11 @@ async function getJwks(env: Env, force = false): Promise<Jwk[]> {
     return jwksCache.keys;
   }
   const url = `https://${env.CF_ACCESS_TEAM_DOMAIN}.cloudflareaccess.com/cdn-cgi/access/certs`;
-  const res = await fetch(url, { cf: { cacheTtl: 3600 } });
+  // On a forced refresh (kid miss after key rotation) bypass the edge cache too —
+  // `cf.cacheTtl` would otherwise re-serve stale certs for up to an hour.
+  const res = force
+    ? await fetch(url, { cache: "no-store" })
+    : await fetch(url, { cf: { cacheTtl: 3600 } });
   if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status}`);
   const body = (await res.json()) as { keys?: unknown };
   if (!Array.isArray(body.keys)) throw new Error("JWKS malformed: no keys array");

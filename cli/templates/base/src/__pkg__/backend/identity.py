@@ -44,16 +44,30 @@ def _verify(token: str, key: str) -> dict:
         raise ValueError("malformed token")
     header_b64, payload_b64, sig_b64 = parts
 
-    header = json.loads(_b64url_decode(header_b64))
+    # Decode defensively: bad base64 / JSON / non-object payloads must surface as
+    # ValueError (→ 401), never an uncaught error (→ 500). binascii.Error and
+    # json.JSONDecodeError are both ValueError subclasses.
+    try:
+        header = json.loads(_b64url_decode(header_b64))
+        sig = _b64url_decode(sig_b64)
+    except ValueError as exc:
+        raise ValueError("malformed token") from exc
+    if not isinstance(header, dict):
+        raise ValueError("malformed header")
     if header.get("alg") != "HS256":
         raise ValueError("unexpected alg")
 
     signing_input = f"{header_b64}.{payload_b64}".encode()
     expected = hmac.new(key.encode(), signing_input, hashlib.sha256).digest()
-    if not hmac.compare_digest(expected, _b64url_decode(sig_b64)):
+    if not hmac.compare_digest(expected, sig):
         raise ValueError("bad signature")
 
-    claims = json.loads(_b64url_decode(payload_b64))
+    try:
+        claims = json.loads(_b64url_decode(payload_b64))
+    except ValueError as exc:
+        raise ValueError("malformed token") from exc
+    if not isinstance(claims, dict):
+        raise ValueError("malformed claims")
     now = int(time.time())
     if claims.get("iss") != ISS:
         raise ValueError("bad iss")
