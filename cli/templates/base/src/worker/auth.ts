@@ -64,6 +64,16 @@ export async function sanitizeAndMint(req: Request, env: Env, id: Identity): Pro
       headers.delete(h);
     }
   }
+  // Don't leak the Access session cookie (CF_Authorization) to the container.
+  const cookies = headers.get("Cookie");
+  if (cookies) {
+    const kept = cookies
+      .split(";")
+      .map((c) => c.trim())
+      .filter((c) => c && !c.startsWith("CF_Authorization="));
+    if (kept.length) headers.set("Cookie", kept.join("; "));
+    else headers.delete("Cookie");
+  }
   headers.set("X-Akm-Identity", await mintInternalJwt(id, env));
   return new Request(req, { headers });
 }
@@ -77,11 +87,19 @@ interface Jwk {
   e: string;
   alg?: string;
 }
-let jwksCache: { keys: Jwk[]; fetchedAt: number } | null = null;
+let jwksCache: { keys: Jwk[]; fetchedAt: number; domain: string } | null = null;
 
-async function getJwks(env: Env): Promise<Jwk[]> {
+// `force` bypasses the cache (used to pick up Access key rotation on a kid miss).
+async function getJwks(env: Env, force = false): Promise<Jwk[]> {
   const now = Date.now();
-  if (jwksCache && now - jwksCache.fetchedAt < 60 * 60 * 1000) return jwksCache.keys;
+  if (
+    !force &&
+    jwksCache &&
+    jwksCache.domain === env.CF_ACCESS_TEAM_DOMAIN &&
+    now - jwksCache.fetchedAt < 60 * 60 * 1000
+  ) {
+    return jwksCache.keys;
+  }
   const url = `https://${env.CF_ACCESS_TEAM_DOMAIN}.cloudflareaccess.com/cdn-cgi/access/certs`;
   const res = await fetch(url, { cf: { cacheTtl: 3600 } });
   if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status}`);
@@ -90,7 +108,7 @@ async function getJwks(env: Env): Promise<Jwk[]> {
   const keys = (body.keys as Jwk[]).filter(
     (k) => k && k.kty === "RSA" && typeof k.kid === "string" && typeof k.n === "string" && typeof k.e === "string",
   );
-  jwksCache = { keys, fetchedAt: now };
+  jwksCache = { keys, fetchedAt: now, domain: env.CF_ACCESS_TEAM_DOMAIN };
   return keys;
 }
 
@@ -106,7 +124,8 @@ async function verifyAccessJwt(token: string, env: Env): Promise<Record<string, 
     const claims = JSON.parse(b64urlToString(p)) as Record<string, unknown>;
     if (header.alg !== "RS256" || !header.kid) return null; // pin alg — no alg confusion
 
-    const jwk = (await getJwks(env)).find((k) => k.kid === header.kid);
+    let jwk = (await getJwks(env)).find((k) => k.kid === header.kid);
+    if (!jwk) jwk = (await getJwks(env, true)).find((k) => k.kid === header.kid); // key rotation
     if (!jwk) return null;
 
     const key = await crypto.subtle.importKey(

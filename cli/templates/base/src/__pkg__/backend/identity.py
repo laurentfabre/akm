@@ -68,6 +68,12 @@ def _verify(token: str, key: str) -> dict:
         raise ValueError("not yet valid")
     if claims.get("kind") not in ("user", "service"):
         raise ValueError("bad kind")
+    sub = claims.get("sub")
+    if not isinstance(sub, str) or not sub:
+        raise ValueError("missing or invalid sub")
+    email = claims.get("email")
+    if email is not None and not isinstance(email, str):
+        raise ValueError("invalid email")
     return claims
 
 

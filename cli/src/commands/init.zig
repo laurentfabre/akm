@@ -22,7 +22,11 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         say("Usage: akm init <name> [dest]\n");
         return error.MissingArgument;
     }
-    const name = args[0];
+    const name_raw = args[0];
+    // Collapse control chars (newlines/tabs) to spaces so the name is safe to drop
+    // into single-line comments/markdown without breaking or injecting.
+    const name = try sanitizeDisplay(gpa, name_raw);
+    defer gpa.free(name);
     const slug = try slugify(gpa, name, '-');
     defer gpa.free(slug);
     const pkg_raw = try slugify(gpa, name, '_');
@@ -31,7 +35,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     defer gpa.free(pkg);
     const pkg_upper = try std.ascii.allocUpperString(gpa, pkg);
     defer gpa.free(pkg_upper);
-    const name_json = try jsonEscape(gpa, name); // safe inside double-quoted Py/TOML/JSON
+    const name_json = try jsonEscape(gpa, name); // safe inside double-quoted Py/TOML/JSON & docstrings
     defer gpa.free(name_json);
     const name_html = try htmlEscape(gpa, name); // safe inside HTML text
     defer gpa.free(name_html);
@@ -40,7 +44,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
 
     var ctx = render.Context.init(gpa);
     defer ctx.deinit();
-    try ctx.put("app_name", name); // raw — used only in markdown/comments
+    try ctx.put("app_name", name); // single-line; safe in markdown/single-line comments
     try ctx.put("app_name_json", name_json);
     try ctx.put("app_name_html", name_html);
     try ctx.put("app_slug", slug);
@@ -121,6 +125,15 @@ fn slugify(gpa: std.mem.Allocator, name: []const u8, sep: u8) ![]u8 {
     }
     if (out.items.len > 0 and out.items[out.items.len - 1] == sep) _ = out.pop();
     if (out.items.len == 0) try out.appendSlice(gpa, "app");
+    return out.toOwnedSlice(gpa);
+}
+
+/// Replace control characters (newline, tab, etc.) with spaces so a freeform
+/// display name can't break single-line comments/markdown or escape contexts.
+fn sanitizeDisplay(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (s) |c| try out.append(gpa, if (c < 0x20 or c == 0x7f) ' ' else c);
     return out.toOwnedSlice(gpa);
 }
 

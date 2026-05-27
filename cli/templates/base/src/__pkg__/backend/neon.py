@@ -51,10 +51,14 @@ def create_db_engine() -> Engine:
 
 
 def create_direct_engine() -> Engine:
-    """Direct-endpoint engine for migrations / session-state operations."""
-    url = settings.database_url_direct or settings.database_url
+    """Direct-endpoint engine for migrations / session-state operations.
+
+    Must NOT fall back to the pooled URL — running DDL/session-state work through
+    PgBouncer transaction pooling is exactly what this endpoint exists to avoid.
+    """
+    url = settings.database_url_direct
     if not url:
-        raise RuntimeError("DATABASE_URL_DIRECT / DATABASE_URL is not set")
+        raise RuntimeError("DATABASE_URL_DIRECT is required (use the Neon direct endpoint, not the pooler)")
     logger.info("Creating Neon engine (direct endpoint)")
     return create_engine(url, pool_pre_ping=True)  # sslmode comes from the URL
 
