@@ -1,22 +1,37 @@
 // container.ts — Durable-Object-backed Container instance manager (see goal.md §5).
 //
 // Cloudflare Containers are backed by a Durable Object. This class owns the
-// container lifecycle: it starts on first request and sleeps after idle.
+// container lifecycle and — critically — forwards the env the FastAPI process
+// needs at startup. Without this, the container boots with no DATABASE_URL
+// (crash) and no AKM_INTERNAL_JWT_KEY (every request 401s).
 import { Container } from "@cloudflare/containers";
 
-export class {{app_pkg}}Backend extends Container {
+interface Env {
+  DATABASE_URL: string;
+  DATABASE_URL_DIRECT: string;
+  AKM_INTERNAL_JWT_KEY: string;
+}
+
+export class {{app_pkg}}Backend extends Container<Env> {
   // The FastAPI/uvicorn process listens here (see Dockerfile).
   defaultPort = 8000;
   // Stop the instance after 10 minutes of inactivity to save cost.
   sleepAfter = "10m";
 
+  // Worker secrets (set via `wrangler secret put …`), shared with the DO and
+  // passed into the container's process environment on start. Without this the
+  // FastAPI process has no DATABASE_URL (crash) or identity key (every req 401s).
+  envVars = {
+    DATABASE_URL: this.env.DATABASE_URL,
+    DATABASE_URL_DIRECT: this.env.DATABASE_URL_DIRECT,
+    AKM_INTERNAL_JWT_KEY: this.env.AKM_INTERNAL_JWT_KEY,
+  };
+
   override onStart() {
     console.log("{{app_slug}} container started");
   }
-  override onStop() {
-    console.log("{{app_slug}} container stopped");
-  }
   override onError(err: unknown) {
     console.error("{{app_slug}} container error:", err);
+    return err;
   }
 }

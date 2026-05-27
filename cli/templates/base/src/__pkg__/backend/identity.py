@@ -59,9 +59,12 @@ def _verify(token: str, key: str) -> dict:
         raise ValueError("bad iss")
     if claims.get("aud") != AUD:
         raise ValueError("bad aud")
-    if "exp" in claims and claims["exp"] < now:
-        raise ValueError("expired")
-    if "nbf" in claims and claims["nbf"] > now + 60:
+    # `exp` is mandatory and numeric — a token without it must not be accepted.
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp <= now:
+        raise ValueError("missing or expired exp")
+    nbf = claims.get("nbf")
+    if isinstance(nbf, (int, float)) and not isinstance(nbf, bool) and nbf > now + 60:
         raise ValueError("not yet valid")
     if claims.get("kind") not in ("user", "service"):
         raise ValueError("bad kind")

@@ -30,12 +30,26 @@ akm dev          # proxy + Vite + uvicorn + Neon dev branch  (P2)
 
 ## Deploy
 
-Prerequisites: a **Workers Paid** plan, local **Docker**, and a Neon project.
+Prerequisites: a **Workers Paid** plan, local **Docker** running, and a Neon project.
+
+Set the secrets (attached to the Worker; the Durable Object forwards the DB +
+identity key into the container):
 
 ```bash
-wrangler secret put AKM_INTERNAL_JWT_KEY
-wrangler secret put DATABASE_URL
-akm deploy       # builds the image + wrangler deploy        (P3)
+wrangler secret put AKM_INTERNAL_JWT_KEY   # same value used by Worker + container
+wrangler secret put DATABASE_URL           # Neon pooled (-pooler) endpoint
+wrangler secret put DATABASE_URL_DIRECT    # Neon direct endpoint (migrations)
+wrangler secret put CF_ACCESS_TEAM_DOMAIN
+wrangler secret put CF_ACCESS_AUD
 ```
 
-> See the parent project's `goal.md` for the full architecture and rationale.
+Apply the schema (Alembic, over the direct endpoint), then deploy:
+
+```bash
+DATABASE_URL_DIRECT=... alembic upgrade head
+wrangler deploy        # builds the container image + deploys Worker/DO/assets
+```
+
+> `akm deploy` (which will automate secrets + migrate + deploy) is not yet
+> implemented — use the `wrangler` commands above for now.
+> See the project `goal.md` for the full architecture and rationale.

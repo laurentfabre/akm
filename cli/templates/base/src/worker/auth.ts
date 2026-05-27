@@ -85,54 +85,59 @@ async function getJwks(env: Env): Promise<Jwk[]> {
   const url = `https://${env.CF_ACCESS_TEAM_DOMAIN}.cloudflareaccess.com/cdn-cgi/access/certs`;
   const res = await fetch(url, { cf: { cacheTtl: 3600 } });
   if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status}`);
-  const body = (await res.json()) as { keys: Jwk[] };
-  jwksCache = { keys: body.keys, fetchedAt: now };
-  return body.keys;
+  const body = (await res.json()) as { keys?: unknown };
+  if (!Array.isArray(body.keys)) throw new Error("JWKS malformed: no keys array");
+  const keys = (body.keys as Jwk[]).filter(
+    (k) => k && k.kty === "RSA" && typeof k.kid === "string" && typeof k.n === "string" && typeof k.e === "string",
+  );
+  jwksCache = { keys, fetchedAt: now };
+  return keys;
 }
 
+// Returns the validated claims, or null for ANY failure (malformed token, bad
+// signature, JWKS problem, failed claim checks). Never throws → never a 500.
 async function verifyAccessJwt(token: string, env: Env): Promise<Record<string, unknown> | null> {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [h, p, s] = parts;
-  let header: { kid?: string; alg?: string };
-  let claims: Record<string, unknown>;
   try {
-    header = JSON.parse(b64urlToString(h));
-    claims = JSON.parse(b64urlToString(p));
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const [h, p, s] = parts;
+
+    const header = JSON.parse(b64urlToString(h)) as { kid?: string; alg?: string };
+    const claims = JSON.parse(b64urlToString(p)) as Record<string, unknown>;
+    if (header.alg !== "RS256" || !header.kid) return null; // pin alg — no alg confusion
+
+    const jwk = (await getJwks(env)).find((k) => k.kid === header.kid);
+    if (!jwk) return null;
+
+    const key = await crypto.subtle.importKey(
+      "jwk",
+      { kty: jwk.kty, n: jwk.n, e: jwk.e, alg: "RS256", ext: true },
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+      false,
+      ["verify"],
+    );
+    const ok = await crypto.subtle.verify(
+      "RSASSA-PKCS1-v1_5",
+      key,
+      b64urlToBytes(s) as BufferSource,
+      enc.encode(`${h}.${p}`) as BufferSource,
+    );
+    if (!ok) return null;
+
+    // Claim checks. `exp` is mandatory; tokens without it are rejected.
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (typeof claims.exp !== "number" || claims.exp <= nowSec) return null;
+    if (typeof claims.nbf === "number" && claims.nbf > nowSec + 60) return null;
+    if (typeof claims.iat === "number" && claims.iat > nowSec + 60) return null;
+    const aud = claims.aud;
+    const audOk = Array.isArray(aud) ? aud.includes(env.CF_ACCESS_AUD) : aud === env.CF_ACCESS_AUD;
+    if (!audOk) return null;
+    if (claims.iss !== `https://${env.CF_ACCESS_TEAM_DOMAIN}.cloudflareaccess.com`) return null;
+
+    return claims;
   } catch {
-    return null;
+    return null; // any unexpected error → treat as auth failure, not a 500
   }
-  if (header.alg !== "RS256" || !header.kid) return null;
-
-  const jwk = (await getJwks(env)).find((k) => k.kid === header.kid);
-  if (!jwk) return null;
-
-  const key = await crypto.subtle.importKey(
-    "jwk",
-    { kty: jwk.kty, n: jwk.n, e: jwk.e, alg: "RS256", ext: true },
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["verify"],
-  );
-  const ok = await crypto.subtle.verify(
-    "RSASSA-PKCS1-v1_5",
-    key,
-    b64urlToBytes(s) as BufferSource,
-    enc.encode(`${h}.${p}`) as BufferSource,
-  );
-  if (!ok) return null;
-
-  // Claim checks.
-  const nowSec = Math.floor(Date.now() / 1000);
-  if (typeof claims.exp === "number" && claims.exp < nowSec) return null;
-  if (typeof claims.nbf === "number" && claims.nbf > nowSec + 60) return null;
-  const aud = claims.aud;
-  const audOk = Array.isArray(aud) ? aud.includes(env.CF_ACCESS_AUD) : aud === env.CF_ACCESS_AUD;
-  if (!audOk) return null;
-  const expectedIss = `https://${env.CF_ACCESS_TEAM_DOMAIN}.cloudflareaccess.com`;
-  if (claims.iss !== expectedIss) return null;
-
-  return claims;
 }
 
 // ── internal X-Akm-Identity minting (HS256) ─────────────────────────────────

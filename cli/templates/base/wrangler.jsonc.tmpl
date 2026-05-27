@@ -36,9 +36,12 @@
   // Live logs + dashboard observability for Worker and container.
   "observability": { "enabled": true },
 
-  // Secrets (set with `wrangler secret put <NAME>`), referenced by the Worker:
-  //   CF_ACCESS_TEAM_DOMAIN, CF_ACCESS_AUD, AKM_INTERNAL_JWT_KEY
-  // Container env (DATABASE_URL, DATABASE_URL_DIRECT, AKM_INTERNAL_JWT_KEY) is
-  // injected at deploy time by `akm deploy`.
+  // Required secrets — set each with `wrangler secret put <NAME>` before deploy.
+  // They are attached to the Worker AND shared with the Durable Object; the DO
+  // (src/worker/container.ts) forwards DATABASE_URL / DATABASE_URL_DIRECT /
+  // AKM_INTERNAL_JWT_KEY into the container process on start.
+  //   Worker uses:    CF_ACCESS_TEAM_DOMAIN, CF_ACCESS_AUD, AKM_INTERNAL_JWT_KEY
+  //   Container uses:  DATABASE_URL, DATABASE_URL_DIRECT, AKM_INTERNAL_JWT_KEY
+  // (CF_ACCESS_TEAM_DOMAIN/CF_ACCESS_AUD are not secret and may instead go in "vars".)
   "vars": {}
 }

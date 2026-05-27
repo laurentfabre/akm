@@ -22,7 +22,7 @@ from typing import Annotated, AsyncGenerator, TypeAlias
 
 from fastapi import Depends, FastAPI, Request
 from sqlalchemy import Engine, create_engine, text
-from sqlmodel import Session, SQLModel
+from sqlmodel import Session
 
 from .config import logger, settings
 
@@ -78,12 +78,6 @@ def validate_db(engine: Engine) -> None:
     raise ConnectionError(f"Failed to connect to Neon: {last_exc}")
 
 
-def initialize_models(engine: Engine) -> None:
-    """v1 schema bootstrap. Production schema changes go through Alembic (direct endpoint)."""
-    logger.info("Initializing models (SQLModel.metadata.create_all)")
-    SQLModel.metadata.create_all(engine)
-
-
 @asynccontextmanager
 async def db_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Build-mode import must not touch the network (see goal.md §4 codegen contract).
@@ -93,9 +87,12 @@ async def db_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         yield
         return
 
+    # Startup only *validates* the (pooled) connection. Schema is owned by Alembic
+    # over the direct endpoint — never run DDL here: with multiple uvicorn workers
+    # on PgBouncer transaction pooling, concurrent create_all() would race.
+    # Run `alembic upgrade head` (DATABASE_URL_DIRECT) at deploy/migration time.
     engine = create_db_engine()
     validate_db(engine)
-    initialize_models(engine)
     app.state.engine = engine
     try:
         yield

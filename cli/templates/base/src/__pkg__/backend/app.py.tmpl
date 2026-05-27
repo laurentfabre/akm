@@ -19,7 +19,7 @@ from .router import router
 def create_app() -> FastAPI:
     build_mode = os.environ.get("AKM_OPENAPI_BUILD") == "1"
     app = FastAPI(
-        title="{{app_name}}",
+        title="{{app_name_json}}",
         # Skip the DB/network lifespan entirely during schema extraction.
         lifespan=None if build_mode else db_lifespan,
     )
