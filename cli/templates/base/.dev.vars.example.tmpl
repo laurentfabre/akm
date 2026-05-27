@@ -1,0 +1,13 @@
+# Copy to .dev.vars (gitignored) for local `wrangler dev`, or let `akm dev` inject these.
+# See goal.md §3 (Neon) and §4.5 (auth).
+
+# Neon endpoints. DATABASE_URL = pooled (-pooler host); DIRECT = migrations/session-state.
+DATABASE_URL="postgresql+psycopg://user:pass@ep-xxx-pooler.region.aws.neon.tech/dbname?sslmode=require"
+DATABASE_URL_DIRECT="postgresql+psycopg://user:pass@ep-xxx.region.aws.neon.tech/dbname?sslmode=require"
+
+# Cloudflare Access (prod). In dev, `akm dev` mints X-Akm-Identity directly.
+CF_ACCESS_TEAM_DOMAIN="myteam"
+CF_ACCESS_AUD="your-access-app-aud-tag"
+
+# Shared HMAC key for the internal X-Akm-Identity JWT. Must match Worker + container.
+AKM_INTERNAL_JWT_KEY="dev-only-change-me"

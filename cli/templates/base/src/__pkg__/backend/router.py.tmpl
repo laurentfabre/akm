@@ -1,0 +1,29 @@
+"""API routes for {{app_name}}. All paths are under /api (run_worker_first)."""
+
+from __future__ import annotations
+
+from fastapi import APIRouter
+from sqlalchemy import text
+
+from .identity import CurrentPrincipal
+from .neon import DbSession
+
+router = APIRouter(prefix="/api")
+
+
+@router.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@router.get("/me")
+def me(principal: CurrentPrincipal) -> dict[str, object]:
+    """Echo the validated caller identity (proves the auth chain end-to-end)."""
+    return {"sub": principal.sub, "email": principal.email, "kind": principal.kind}
+
+
+@router.get("/db-check")
+def db_check(session: DbSession, principal: CurrentPrincipal) -> dict[str, object]:
+    """Round-trip to Neon, gated by a valid identity."""
+    value = session.execute(text("SELECT 1")).scalar_one()
+    return {"db": value, "as": principal.sub}

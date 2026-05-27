@@ -1,0 +1,44 @@
+{
+  // Cloudflare config for {{app_name}} (see goal.md §5).
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "{{app_slug}}",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Static SPA assets. run_worker_first sends ONLY /api/* to the Worker;
+  // unknown deep links fall back to index.html for client-side routing.
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"],
+    "not_found_handling": "single-page-application"
+  },
+
+  // FastAPI backend runs in a Container, managed by a Durable Object.
+  "containers": [
+    {
+      "class_name": "{{app_pkg}}Backend",
+      "image": "./Dockerfile",
+      "instances": 1,
+      "name": "{{app_slug}}-backend"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "{{app_pkg}}Backend", "name": "{{app_pkg_upper}}_BACKEND" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["{{app_pkg}}Backend"] }
+  ],
+
+  // Live logs + dashboard observability for Worker and container.
+  "observability": { "enabled": true },
+
+  // Secrets (set with `wrangler secret put <NAME>`), referenced by the Worker:
+  //   CF_ACCESS_TEAM_DOMAIN, CF_ACCESS_AUD, AKM_INTERNAL_JWT_KEY
+  // Container env (DATABASE_URL, DATABASE_URL_DIRECT, AKM_INTERNAL_JWT_KEY) is
+  // injected at deploy time by `akm deploy`.
+  "vars": {}
+}

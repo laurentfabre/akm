@@ -1,0 +1,3 @@
+# build artifacts
+cli/zig-out/
+cli/.zig-cache/

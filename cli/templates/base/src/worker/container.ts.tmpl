@@ -1,0 +1,22 @@
+// container.ts — Durable-Object-backed Container instance manager (see goal.md §5).
+//
+// Cloudflare Containers are backed by a Durable Object. This class owns the
+// container lifecycle: it starts on first request and sleeps after idle.
+import { Container } from "@cloudflare/containers";
+
+export class {{app_pkg}}Backend extends Container {
+  // The FastAPI/uvicorn process listens here (see Dockerfile).
+  defaultPort = 8000;
+  // Stop the instance after 10 minutes of inactivity to save cost.
+  sleepAfter = "10m";
+
+  override onStart() {
+    console.log("{{app_slug}} container started");
+  }
+  override onStop() {
+    console.log("{{app_slug}} container stopped");
+  }
+  override onError(err: unknown) {
+    console.error("{{app_slug}} container error:", err);
+  }
+}

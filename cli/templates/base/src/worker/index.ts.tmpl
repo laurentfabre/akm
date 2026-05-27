@@ -1,0 +1,40 @@
+// index.ts — the edge Worker entry (see goal.md §2, §4.5, §5).
+//
+// Responsibilities:
+//   - Serve the built SPA as static assets (handled by the assets binding;
+//     `not_found_handling: single-page-application` covers deep-link refresh).
+//   - For /api/*: authenticate via Cloudflare Access, sanitize the request,
+//     mint X-Akm-Identity, and route to the FastAPI container.
+//   - Bindings (R2/KV/AI) live here; the Python container reaches them by
+//     calling back through this Worker (none are exposed to it directly).
+import { getContainer } from "@cloudflare/containers";
+import { authenticate, sanitizeAndMint, type Env as AuthEnv } from "./auth";
+
+export { {{app_pkg}}Backend } from "./container";
+
+interface Env extends AuthEnv {
+  {{app_pkg_upper}}_BACKEND: DurableObjectNamespace;
+  ASSETS: Fetcher;
+}
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url);
+
+    if (url.pathname.startsWith("/api/")) {
+      const id = await authenticate(req, env);
+      if (!id) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const forwarded = await sanitizeAndMint(req, env, id);
+
+      // Single-tenant routing: one container instance keyed by app name.
+      // For N stateless replicas, swap getContainer(...) for getRandom(...).
+      const container = getContainer(env.{{app_pkg_upper}}_BACKEND, "{{app_slug}}");
+      return container.fetch(forwarded);
+    }
+
+    // Everything else: static assets (run_worker_first sends only /api/* here).
+    return env.ASSETS.fetch(req);
+  },
+};

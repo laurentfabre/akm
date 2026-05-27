@@ -1,0 +1,17 @@
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+// {{app_name}} UI build. Output goes to ./dist, which the Worker serves as
+// static assets (see wrangler.jsonc). In dev, `akm dev` proxies /api/* to the
+// backend and everything else to this server.
+export default defineConfig({
+  plugins: [react()],
+  root: "ui",
+  build: {
+    outDir: "../dist",
+    emptyOutDir: true,
+  },
+  server: {
+    port: 5173,
+  },
+});

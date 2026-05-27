@@ -1,0 +1,30 @@
+"""FastAPI application factory for {{app_name}}.
+
+Build-mode contract (see goal.md §4): when AKM_OPENAPI_BUILD=1, importing this
+module and calling `create_app().openapi()` MUST NOT touch the network, DB,
+secrets, or run lifespan startup. The DB lifespan honors the flag (see neon.py),
+so `akm build` can extract the OpenAPI schema with no environment at all.
+"""
+
+from __future__ import annotations
+
+import os
+
+from fastapi import FastAPI
+
+from .neon import db_lifespan
+from .router import router
+
+
+def create_app() -> FastAPI:
+    build_mode = os.environ.get("AKM_OPENAPI_BUILD") == "1"
+    app = FastAPI(
+        title="{{app_name}}",
+        # Skip the DB/network lifespan entirely during schema extraction.
+        lifespan=None if build_mode else db_lifespan,
+    )
+    app.include_router(router)
+    return app
+
+
+app = create_app()

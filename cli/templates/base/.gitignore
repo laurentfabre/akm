@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+__pycache__/
+*.pyc
+.venv/
+openapi.json
+src/ui/api/schema.ts

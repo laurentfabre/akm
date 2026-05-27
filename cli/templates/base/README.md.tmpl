@@ -1,0 +1,41 @@
+# {{app_name}}
+
+A full-stack app on **Cloudflare** (Workers + Containers) with **Neon** Postgres,
+scaffolded by `akm`.
+
+## Stack
+
+- **Frontend:** React + Vite → static assets served by a Worker.
+- **Backend:** FastAPI in a Cloudflare Container (managed by a Durable Object).
+- **DB:** Neon Serverless Postgres (pooled endpoint for traffic, direct for migrations).
+- **Auth:** Cloudflare Access → the Worker validates the Access JWT and mints an
+  internal `X-Akm-Identity` the backend trusts.
+
+## Layout
+
+```
+src/worker/      Worker entry, Container DO, Access→identity auth
+src/{{app_pkg}}/backend/   FastAPI app, Neon engine, identity validation
+ui/              React frontend
+migrations/      Alembic (direct endpoint)
+wrangler.jsonc   Cloudflare config (containers + DO + assets)
+Dockerfile       Backend container image (linux/amd64)
+```
+
+## Develop
+
+```bash
+akm dev          # proxy + Vite + uvicorn + Neon dev branch  (P2)
+```
+
+## Deploy
+
+Prerequisites: a **Workers Paid** plan, local **Docker**, and a Neon project.
+
+```bash
+wrangler secret put AKM_INTERNAL_JWT_KEY
+wrangler secret put DATABASE_URL
+akm deploy       # builds the image + wrangler deploy        (P3)
+```
+
+> See the parent project's `goal.md` for the full architecture and rationale.
