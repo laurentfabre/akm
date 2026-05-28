@@ -127,12 +127,13 @@ graph LR
 | Command | Status | Approach |
 |---|---|---|
 | `init` | ✅ built | scaffolder: render embedded templates (`@embedFile`) via a small template engine |
-| `dev` | planned | orchestrate Vite + uvicorn + Neon-branch/local-PG; reverse proxy; mock Access JWT; file-watch reload |
-| `build` | planned | codegen → vite build → assemble Worker + Container (Dockerfile) artifacts |
-| `deploy` | planned | wrap `wrangler deploy`; manage secrets, bindings, DO migration, Neon branch |
-| `logs` | planned | wrap `wrangler tail` (with documented limits, §5) |
-| `components` | planned | shadcn registry fetch/add (HTTP + file writes) |
+| `dev` | ✅ built | reverse proxy (`/api`→uvicorn, `/*`→Vite) minting `X-Akm-Identity`; full WS/HMR tunnel; spawns uvicorn+Vite in own process groups; optional `--neon-branch` (ephemeral branch create/delete) |
+| `build` | ✅ built | emit `openapi.json` (build-mode import) → `openapi-typescript` → `vite build`; `--skip-codegen` |
+| `deploy` | ✅ built | build → optional `--migrate` (alembic) → optional `--secrets` (`wrangler secret bulk` via stdin) → `wrangler deploy`; `--dry-run`/`--env`. Real-path unverified against cloud (by choice) |
+| `logs` | ✅ built | wrap `wrangler tail` (live Worker tail) + print the §5 caveat (container logs → Observability dashboard); `--env`/`--format` |
+| `components` | ✅ built | shadcn registry fetch/add over HTTPS (`std.http.Client`) + file writes; `init` makes the app shadcn-ready (Tailwind v4 + `cn` + `@/` alias); `add <name…>` resolves registryDependencies + installs npm deps |
 | `frontend` | planned | thin wrapper over Bun/Vite/npm |
+| `preview` | ✅ built | per-PR preview: named Worker `{base}-pr-{id}` via `wrangler deploy --name` + ephemeral Neon branch `akm-pr-{id}`; `create`/`destroy` for CI (no native preview URL for DO/Container Workers, §5) |
 | `mcp` | v2 | JSON-RPC over stdio in Zig |
 
 > akm intentionally has **no `serve` command** — production serving is Cloudflare's job (§0).
@@ -201,11 +202,11 @@ The single contract, in strict order:
 
 | Phase | Deliverable | Exit criteria |
 |---|---|---|
-| **P0 Spikes** | De-risk the 4 hard CLI problems **+ the DO-backed Container path + Neon dual-endpoint connect + Access→internal-JWT chain + container-log access** | A hand-built Worker→DO→Container FastAPI app, behind Access (JWT validated → internal `X-Akm-Identity` minted/verified), talking to Neon (pooled + direct, survives scale-to-zero), deployed via `wrangler`. **Verify** whether `wrangler tail` streams container stdout/stderr (else dashboard-only). Cold-start + first-deploy provisioning time **measured**. Zig proxy with mock-JWT injection + HMR works (or fallback chosen). |
+| **P0 Spikes** _(⏸ deferred indefinitely)_ | De-risk the 4 hard CLI problems **+ the DO-backed Container path + Neon dual-endpoint connect + Access→internal-JWT chain + container-log access** | A hand-built Worker→DO→Container FastAPI app, behind Access (JWT validated → internal `X-Akm-Identity` minted/verified), talking to Neon (pooled + direct, survives scale-to-zero), deployed via `wrangler`. **Verify** whether `wrangler tail` streams container stdout/stderr (else dashboard-only). Cold-start + first-deploy provisioning time **measured**. Zig proxy with mock-JWT injection + HMR works (or fallback chosen). _Most CLI-side de-risking already proven locally; the live-Cloudflare deploy is parked — see `scripts/p0-deploy.sh`._ |
 | **P1 Templates** | `neon.py` (dual URL), Access-JWT auth, `worker/index.ts` + `Container` DO class, `wrangler.jsonc`, `Dockerfile`, Alembic | Generated app builds & deploys by hand (no Zig CLI yet) — _templates authored_ |
-| **P2 Zig core** | `init`, `build`, `dev` in Zig | `akm init && akm dev` runs a full local app against a Neon dev branch — _`init` built_ |
-| **P3 Zig deploy** | `deploy`, `logs`, `components`, codegen orchestration, per-PR env + Neon branch | `akm deploy` ships to Cloudflare; typed TS client regenerates |
-| **P4 Polish** | secrets UX, per-PR preview automation, telemetry via `wrangler tail`/Logs, docs | green e2e on a non-trivial sample app |
+| **P2 Zig core** _(✅ done)_ | `init`, `build`, `dev` in Zig | `akm init && akm dev` runs a full local app against a Neon dev branch — _verified incl. a live `--neon-branch` run + `/api/db-check` round-trip_ |
+| **P3 Zig deploy** _(✅ done)_ | `deploy`, `logs`, `components`, codegen orchestration, per-PR env + Neon branch | `akm deploy` ships to Cloudflare; typed TS client regenerates — _all built: `deploy`/`logs`/`components`/`preview` (Cloudflare paths dry-run-verified; Neon-branch lifecycle live-verified)_ |
+| **P4 Polish** | secrets UX, per-PR preview automation, telemetry via `wrangler tail`/Logs, docs | green e2e on a non-trivial sample app — _secrets UX (`.prod.vars` + `secret bulk`), per-PR preview (`akm preview create/destroy`), and `logs` done; **remaining: live e2e (needs the P0 spike)**_ |
 | **P5 (opt)** | MCP server; Workers-AI addon; **Neon Data API RLS addon** (Worker-layer); KV/DO/R2/D1/Queues addons | each independent |
 
 ---

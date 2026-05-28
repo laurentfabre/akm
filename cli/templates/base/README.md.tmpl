@@ -24,32 +24,108 @@ Dockerfile       Backend container image (linux/amd64)
 
 ## Develop
 
+`akm dev` runs the whole app on **one origin** for local development. It starts
+uvicorn (FastAPI, `--reload`) and the Vite dev server, then fronts both with a
+reverse proxy: `/api/*` goes to the backend, everything else to Vite. On every
+`/api` request the proxy strips client identity headers and injects a freshly
+minted `X-Akm-Identity` — the *same* assertion the prod Worker mints — so the
+backend's auth path is identical locally and in production.
+
+Prerequisites: [`uv`](https://docs.astral.sh/uv/) and `npm`. First time:
+
 ```bash
-akm dev          # proxy + Vite + uvicorn + Neon dev branch  (P2)
+uv sync                       # backend deps
+npm install                   # UI + wrangler deps
+cp .dev.vars.example .dev.vars   # set DATABASE_URL / DATABASE_URL_DIRECT
+akm dev                       # → http://localhost:8787
 ```
+
+`akm dev` reads `.dev.vars` for `DATABASE_URL*` and `AKM_INTERNAL_JWT_KEY`
+(if the key is absent, an ephemeral one is generated for the session and shared
+with the backend). HMR works through the proxy; edits to `ui/` reload live.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `[dir]` | `.` | Project directory |
+| `--port N` | `8787` | Proxy (the URL you open) |
+| `--backend-port N` | `8000` | uvicorn |
+| `--vite-port N` | `5173` | Vite |
+| `--dev-user EMAIL` | `dev@akm.local` | Identity injected on `/api/*` |
+| `--neon-branch` | off | Create an ephemeral Neon branch for the session (deleted on exit) |
+| `--neon-project ID` | — | Neon project for `--neon-branch` (or `NEON_PROJECT_ID`) |
+
+```bash
+# Run against a throwaway Neon dev branch (needs neonctl auth):
+akm dev --neon-branch --neon-project <project-id>
+```
+
+Quick check once it's up:
+
+```bash
+curl localhost:8787/api/health   # {"status":"ok"}
+curl localhost:8787/api/me       # echoes the injected dev identity
+```
+
+### UI components (shadcn/ui)
+
+```bash
+akm components init              # one-time: Tailwind v4 + cn util + @/ alias
+akm components add button card   # fetch components into ui/components/ui/
+```
+
+`components add` pulls from the shadcn registry over HTTPS, writes the files, and
+installs their npm deps. Import them with the `@/` alias, e.g.
+`import { Button } from "@/components/ui/button"`.
 
 ## Deploy
 
-Prerequisites: a **Workers Paid** plan, local **Docker** running, and a Neon project.
+Prerequisites: a **Workers Paid** plan (Containers aren't on the free tier), local
+**Docker** running, a Neon project, `npm install` done, and `wrangler login`.
 
-Set the secrets (attached to the Worker; the Durable Object forwards the DB +
-identity key into the container):
-
-```bash
-wrangler secret put AKM_INTERNAL_JWT_KEY   # same value used by Worker + container
-wrangler secret put DATABASE_URL           # Neon pooled (-pooler) endpoint
-wrangler secret put DATABASE_URL_DIRECT    # Neon direct endpoint (migrations)
-wrangler secret put CF_ACCESS_TEAM_DOMAIN
-wrangler secret put CF_ACCESS_AUD
-```
-
-Apply the schema (Alembic, over the direct endpoint), then deploy:
+Put your production secrets in a `.prod.vars` file (same `KEY="value"` format as
+`.dev.vars`, and **gitignored** — never commit it):
 
 ```bash
-DATABASE_URL_DIRECT=... alembic upgrade head
-wrangler deploy        # builds the container image + deploys Worker/DO/assets
+# .prod.vars
+AKM_INTERNAL_JWT_KEY="…"          # same value the Worker + container share
+DATABASE_URL="…-pooler…"           # Neon pooled endpoint (app traffic)
+DATABASE_URL_DIRECT="…"            # Neon direct endpoint (migrations)
+CF_ACCESS_TEAM_DOMAIN="myteam"
+CF_ACCESS_AUD="…"
 ```
 
-> `akm deploy` (which will automate secrets + migrate + deploy) is not yet
-> implemented — use the `wrangler` commands above for now.
-> See the project `goal.md` for the full architecture and rationale.
+Validate everything without deploying (no account/Docker needed):
+
+```bash
+akm deploy --dry-run               # build + validate wrangler config & bundle
+```
+
+Then deploy — `akm deploy` builds artifacts, uploads the secrets atomically
+(`wrangler secret bulk`), and runs `wrangler deploy` (which builds the container
+image and deploys the Worker / Durable Object / assets):
+
+```bash
+akm deploy --secrets .prod.vars --migrate
+#   --migrate        run `alembic upgrade head` over DATABASE_URL_DIRECT first
+#   --env NAME       target a named wrangler environment (define it in wrangler.jsonc)
+#   --skip-build     deploy already-built artifacts
+```
+
+> Prefer raw tooling? `npm run build` then `wrangler secret put …` + `wrangler deploy`
+> still work. See the project `goal.md` for the full architecture and rationale.
+
+### Preview deploys (per PR)
+
+Each PR gets an isolated **named Worker** (`{{app_slug}}-pr-<id>`) plus its own
+**ephemeral Neon branch** (`akm-pr-<id>`). Container/DO Workers don't get native
+Wrangler preview URLs (goal.md §5), so this uses a named deploy rather than a preview URL.
+Wire these into CI (PR opened / closed):
+
+```bash
+akm preview create  --pr 123 --neon-project <id> --secrets .prod.vars   # on open/update
+akm preview destroy --pr 123 --neon-project <id>                        # on close/merge
+```
+
+`create` makes/reuses the Neon branch, injects its DB URLs as the Worker's secrets
+(other secrets come from `--secrets`), and deploys; `destroy` deletes the Worker and the
+branch. Add `--dry-run` to validate without deploying.

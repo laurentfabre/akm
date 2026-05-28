@@ -12,6 +12,12 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
+    host: "127.0.0.1",
     port: 5173,
+    strictPort: true,
+    // `akm dev` fronts this server on one origin (http://localhost:8787) and
+    // tunnels the HMR WebSocket through that origin. Accept the proxied Host so
+    // Vite doesn't reject requests that arrive via the proxy.
+    allowedHosts: true,
   },
 });
