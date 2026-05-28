@@ -87,6 +87,14 @@ pub fn run(io: std.Io, cfg: Config, stop: *std.atomic.Value(bool)) !void {
         };
         t.detach();
     }
+
+    // Drain in-flight handlers before returning so none outlives the caller-owned
+    // Config (e.g. cfg.minter.key, freed by dev.run on unwind). Bounded (~1s) so
+    // a stuck connection can't hang shutdown.
+    var spins: usize = 0;
+    while (active_conns.load(.acquire) > 0 and spins < 100) : (spins += 1) {
+        io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch break;
+    }
 }
 
 /// Max concurrent connection handlers (see the accept loop). A localhost dev
@@ -146,6 +154,7 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
     var headers: std.ArrayList(Header) = .empty;
     var content_length: ?u64 = null;
     var chunked = false;
+    var has_te = false;
     var has_upgrade = false;
     var conn_upgrade = false;
 
@@ -166,8 +175,9 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
             if (content_length) |existing| {
                 if (existing != parsed) return error.BadRequest;
             } else content_length = parsed;
-        } else if (eqlIc(name, "transfer-encoding") and containsIc(value, "chunked")) {
-            chunked = true;
+        } else if (eqlIc(name, "transfer-encoding")) {
+            has_te = true; // ANY TE alongside Content-Length is a smuggling vector
+            if (containsIc(value, "chunked")) chunked = true;
         } else if (eqlIc(name, "connection") and containsIc(value, "upgrade")) {
             conn_upgrade = true;
         } else if (eqlIc(name, "upgrade")) {
@@ -175,9 +185,10 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
         }
         try headers.append(a, .{ .name = try a.dupe(u8, name), .value = try a.dupe(u8, value) });
     }
-    // RFC 9112 §6.1: Transfer-Encoding + Content-Length together is a smuggling
-    // vector — reject rather than guess which framing wins.
-    if (chunked and content_length != null) return error.BadRequest;
+    // RFC 9112 §6.1: ANY Transfer-Encoding + Content-Length together is a
+    // smuggling vector — reject rather than guess which framing wins (not just
+    // `chunked` + CL: e.g. `Transfer-Encoding: gzip` + CL must fail too).
+    if (has_te and content_length != null) return error.BadRequest;
 
     return .{
         .request_line = request_line,
@@ -496,6 +507,8 @@ test "parseRequestHead: rejects malformed/smuggling/oversized heads" {
     try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"));
     // conflicting duplicate Content-Length (CL/CL smuggling)
     try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 50\r\n\r\n"));
+    // ANY Transfer-Encoding (not just chunked) + Content-Length is smuggling
+    try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: gzip\r\n\r\n"));
     // identical duplicate CL is tolerated (treated as one)
     const dup = try parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n");
     try testing.expectEqual(@as(?u64, 5), dup.content_length);

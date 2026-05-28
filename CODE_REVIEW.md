@@ -28,6 +28,15 @@ M1 ✅ reject conflicting duplicate CL · M2 ✅ tunnel only on 101 · M3 ✅ ne
 N4 (proxy cfg lifetime on shutdown) — deferred: MINOR, tiny exit-only window, conflicts with the detached-handler design; not BLOCKER/MAJOR.
 Tests: 53 unit (＋6) green; e2e 52/52; dev-smoke 10/10.
 
+## Round 2 (re-audit of the fixed code) — new findings, all fixed
+- **R2-B1 (BLOCKER)** p0-deploy.sh `DRY_RUN_ONLY=1` still ensured a real Neon branch (round-1 fix was preview.zig only). ✅ early DRY_RUN_ONLY exit before any Neon/`.prod.vars` mutation.
+- **R2-M1 (MAJOR, auth)** NaN/Infinity NumericDate bypass: `json.loads` accepts `NaN`; every comparison with NaN is False, so `iat:NaN`/`exp:NaN` slipped past expiry + the M4 window cap. ✅ `_loads_strict` (parse_constant rejects non-finite) + `_numeric_date` (isfinite, non-bool) + `nbf` now mandatory. Verified 7/7 (NaN/Infinity/missing-nbf rejected).
+- **R2-M2 (MAJOR, regression from N3)** `.dev.vars.example` key was shorter than the new 32-char minimum → `cp … && akm dev` would 500. ✅ example key now ≥32 chars + a generate hint.
+- **R2-m1 (MINOR)** proxy: only `chunked` TE was rejected with CL; `Transfer-Encoding: gzip`+CL slipped. ✅ reject ANY TE+CL.
+- **R2-m2 (MINOR, = N4)** proxy detached handlers could outlive `cfg.minter.key` on shutdown. ✅ bounded (~1s) connection drain before `proxy.run` returns.
+- **R2-m3 (MINOR, latent)** render `skipBlock` only tracked one block kind → cross-kind mis-nesting in a skipped branch went unreported. ✅ LIFO stack across all kinds.
+Round-2 audit otherwise verified every round-1 fix present and correct. Tests: 54 unit green.
+
 ## MINOR (FIX cheap ones)
 - **N1 `.dev.vars` NUL → panic** (project.zig parseVars) — invalid key/value bytes panic `Environ.Map.put`. Validate keys, reject NUL, error with line number.
 - **N2 Dockerfile runs as root** — add a non-root `USER` before `CMD`.

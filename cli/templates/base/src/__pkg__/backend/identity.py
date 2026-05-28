@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import time
 from base64 import urlsafe_b64decode
 from dataclasses import dataclass
@@ -47,6 +48,25 @@ def _b64url_decode(seg: str) -> bytes:
     return urlsafe_b64decode(seg + "=" * (-len(seg) % 4))
 
 
+def _reject_constant(_: str) -> float:
+    # json.loads accepts non-standard NaN/Infinity by default. Every comparison
+    # with NaN is False, so `iat: NaN` / `exp: NaN` would slip past the expiry
+    # and replay-window checks below — reject them at parse time.
+    raise ValueError("non-finite number in token")
+
+
+def _loads_strict(data: bytes) -> object:
+    return json.loads(data, parse_constant=_reject_constant)
+
+
+def _numeric_date(claims: dict, name: str) -> float:
+    """A mandatory, finite, non-bool NumericDate claim (e.g. iat/nbf/exp)."""
+    v = claims.get(name)
+    if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
+        raise ValueError(f"missing or invalid {name}")
+    return v
+
+
 def _verify(token: str, key: str) -> dict:
     parts = token.split(".")
     if len(parts) != 3:
@@ -57,7 +77,7 @@ def _verify(token: str, key: str) -> dict:
     # ValueError (→ 401), never an uncaught error (→ 500). binascii.Error and
     # json.JSONDecodeError are both ValueError subclasses.
     try:
-        header = json.loads(_b64url_decode(header_b64))
+        header = _loads_strict(_b64url_decode(header_b64))
         sig = _b64url_decode(sig_b64)
     except ValueError as exc:
         raise ValueError("malformed token") from exc
@@ -72,7 +92,7 @@ def _verify(token: str, key: str) -> dict:
         raise ValueError("bad signature")
 
     try:
-        claims = json.loads(_b64url_decode(payload_b64))
+        claims = _loads_strict(_b64url_decode(payload_b64))
     except ValueError as exc:
         raise ValueError("malformed token") from exc
     if not isinstance(claims, dict):
@@ -82,21 +102,21 @@ def _verify(token: str, key: str) -> dict:
         raise ValueError("bad iss")
     if claims.get("aud") != AUD:
         raise ValueError("bad aud")
-    # `iat` is mandatory and numeric — required to bound the lifetime below, and
-    # must not be in the future (beyond clock skew).
-    iat = claims.get("iat")
-    if not isinstance(iat, (int, float)) or isinstance(iat, bool) or iat > now + CLOCK_SKEW_SECONDS:
-        raise ValueError("missing or invalid iat")
-    # `exp` is mandatory, numeric, and unexpired.
-    exp = claims.get("exp")
-    if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp <= now:
-        raise ValueError("missing or expired exp")
+    # iat/nbf/exp are all mandatory, finite, non-bool NumericDates (the minters
+    # emit all three). Using a strict helper + finite check defeats the NaN trick
+    # where every comparison is False and slips past the expiry/window checks.
+    iat = _numeric_date(claims, "iat")
+    if iat > now + CLOCK_SKEW_SECONDS:
+        raise ValueError("iat in the future")
+    exp = _numeric_date(claims, "exp")
+    if exp <= now:
+        raise ValueError("expired exp")
     # Enforce the replay window at the trust boundary: even a validly-signed token
     # may not claim a lifetime longer than the contract (≤120s + skew).
     if exp - iat > MAX_TTL_SECONDS + CLOCK_SKEW_SECONDS:
         raise ValueError("token lifetime too long")
-    nbf = claims.get("nbf")
-    if isinstance(nbf, (int, float)) and not isinstance(nbf, bool) and nbf > now + 60:
+    nbf = _numeric_date(claims, "nbf")
+    if nbf > now + CLOCK_SKEW_SECONDS:
         raise ValueError("not yet valid")
     if claims.get("kind") not in ("user", "service"):
         raise ValueError("bad kind")

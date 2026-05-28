@@ -72,6 +72,17 @@ step "Install dependencies"
 uv sync >/dev/null && ok "uv sync"
 npm install --silent >/dev/null && ok "npm install"
 
+# ── DRY_RUN_ONLY short-circuit: validate WITHOUT touching the cloud ─────────
+# `akm deploy --dry-run` only validates the wrangler config + bundle (no secrets,
+# no DB), so a validate-only run must NOT create the Neon branch or write
+# .prod.vars. Do that before the cloud-mutating sections below.
+if [ "$DRY_RUN_ONLY" = 1 ]; then
+  step "DRY_RUN_ONLY=1 — skipping Neon branch + .prod.vars (no cloud mutation)"
+  "$AKM_BIN" deploy --dry-run
+  ok "dry-run passed"
+  step "Done (DRY_RUN_ONLY=1)"; exit 0
+fi
+
 # ── 3. ensure a dedicated Neon spike branch + fetch connection strings ──────
 step "Neon branch '$NEON_BRANCH' on project $NEON_PROJECT"
 # Pass the branch name as argv (NOT spliced into the source) — a name with a
@@ -112,12 +123,10 @@ if grep -q CHANGEME .prod.vars 2>/dev/null; then
 fi
 
 # ── 5. validate (no account / Docker needed) ────────────────────────────────
+# (DRY_RUN_ONLY already exited above, before any cloud mutation.)
 step "Validate (akm deploy --dry-run)"
 "$AKM_BIN" deploy --dry-run
 ok "dry-run passed"
-if [ "$DRY_RUN_ONLY" = 1 ]; then
-  step "Done (DRY_RUN_ONLY=1)"; exit 0
-fi
 
 # ── 6. real-deploy preflight (stop gracefully, don't error, if not ready) ───
 step "Real-deploy preflight"
