@@ -69,6 +69,13 @@ Round-5 verdict: auth SHIP, cmds SHIP, core SHIP-with-fixes (no BLOCKER). Tests 
 - **R6-3 (MINOR)** p0-deploy preflight required Neon-only tools (`neonctl`/`python3`/`openssl`) even for `DRY_RUN_ONLY`. ✅ check build tools up front; Neon tools only after the dry-run gate.
 Round-6 verdict: auth SHIP, core SHIP, cmds SHIP. Tests after fixes: 56 unit / 52 e2e / 10 dev-smoke.
 
+## Round 7 (re-audit) — auth SHIP; 2 new MAJORs (fresh angles) + 2 MINOR, all fixed
+- **R7-1 (MAJOR)** components: `isSafeDepSpec` allowed non-registry sources (`https://…`, `git+ssh://…`, `file:…`, paths) → RCE via npm lifecycle scripts from a compromised registry. ✅ restrict to `(@scope/)?name(@version)?` — reject any `:` and any non-scope `/`.
+- **R7-2 (MAJOR)** preview: `parseWorkerName` raw-scanned the first `"name"`, matching inside JSONC comments → could target/delete the wrong Worker. ✅ `stripJsoncComments` (string-aware) before parsing.
+- **R7-3 (MINOR)** proxy: embedded bare CR/LF/NUL in a header (split is on `\n`) reserialized upstream = injection. ✅ `hasForbidden` rejects them in the request line + headers.
+- **R7-4 (MINOR)** proxy: `Expect: 100-continue` stalled a handler. ✅ proxy answers `100 Continue` itself and strips `Expect` from the upstream head.
+Round-7 verdict: auth SHIP; core/cmds fixed. Tests after fixes: 57 unit / 52 e2e / 10 dev-smoke.
+
 ## MINOR (FIX cheap ones)
 - **N1 `.dev.vars` NUL → panic** (project.zig parseVars) — invalid key/value bytes panic `Environ.Map.put`. Validate keys, reject NUL, error with line number.
 - **N2 Dockerfile runs as root** — add a non-root `USER` before `CMD`.

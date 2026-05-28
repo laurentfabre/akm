@@ -352,12 +352,21 @@ fn patch(
     say("\n");
 }
 
-/// A plausible npm package spec: non-empty, not an option (no leading `-`), no
-/// whitespace/control bytes. Tight enough to block flag injection from an
-/// untrusted registry while accepting `@scope/name`, `name@version`, etc.
+/// A plausible npm *package* spec (registry source only): `(@scope/)?name`
+/// optionally with an `@version`/range. Rejects flags (leading `-`),
+/// whitespace/control bytes, AND non-registry sources — a `:` (so `https://…`,
+/// `git+ssh://…`, `git:`, `file:` are out) and any `/` that isn't the single
+/// `@scope/` separator (so local paths like `./x` are out). A compromised
+/// registry must not be able to make `npm install` run arbitrary code from a
+/// URL/git/file/path source via lifecycle scripts.
 fn isSafeDepSpec(p: []const u8) bool {
     if (p.len == 0 or p[0] == '-') return false;
     for (p) |c| if (c <= ' ' or c == 0x7f) return false;
+    if (std.mem.indexOfScalar(u8, p, ':') != null) return false; // URLs / git: / file:
+    if (std.mem.indexOfScalar(u8, p, '/')) |slash| {
+        if (p[0] != '@') return false; // only @scope/name may contain a slash
+        if (std.mem.indexOfScalarPos(u8, p, slash + 1, '/') != null) return false; // one slash max
+    }
     return true;
 }
 
@@ -585,4 +594,11 @@ test "isSafeDepSpec accepts package specs, rejects flag/injection" {
     try testing.expect(!isSafeDepSpec("-g")); // short flag
     try testing.expect(!isSafeDepSpec("foo bar")); // whitespace
     try testing.expect(!isSafeDepSpec("a\nb")); // control char
+    // non-registry sources → RCE via npm lifecycle scripts; reject
+    try testing.expect(!isSafeDepSpec("https://attacker.example/pkg.tgz"));
+    try testing.expect(!isSafeDepSpec("git+ssh://git@evil/x.git"));
+    try testing.expect(!isSafeDepSpec("file:../../etc"));
+    try testing.expect(!isSafeDepSpec("./local"));
+    try testing.expect(!isSafeDepSpec("foo/bar")); // unscoped path
+    try testing.expect(!isSafeDepSpec("@scope/a/b")); // too many slashes
 }

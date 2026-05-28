@@ -239,11 +239,59 @@ fn readWorkerName(gpa: std.mem.Allocator, io: std.Io, proj: std.Io.Dir) ![]u8 {
         return error.NoProject;
     };
     defer gpa.free(bytes);
-    const name = parseWorkerName(bytes) orelse {
+    // Strip JSONC comments FIRST so a `// "name": "other"` comment (or a `"name"`
+    // inside a `/* */` block) can't be mistaken for the real top-level key — that
+    // could make preview target/delete the wrong Worker.
+    const clean = try stripJsoncComments(gpa, bytes);
+    defer gpa.free(clean);
+    const name = parseWorkerName(clean) orelse {
         say("akm preview: no \"name\" in wrangler.jsonc\n");
         return error.NoProject;
     };
     return gpa.dupe(u8, name);
+}
+
+/// Blank out JSONC comments (`//…` line and `/* … */` block) while preserving
+/// string contents, so a `//` inside a string value (e.g. `"https://…"`) is not
+/// treated as a comment. Returns an owned copy the same length as `src`.
+fn stripJsoncComments(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
+    const out = try gpa.dupe(u8, src);
+    var i: usize = 0;
+    var in_str = false;
+    while (i < out.len) {
+        const c = out[i];
+        if (in_str) {
+            if (c == '\\' and i + 1 < out.len) {
+                i += 2; // skip an escaped char (e.g. \")
+                continue;
+            }
+            if (c == '"') in_str = false;
+            i += 1;
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+            i += 1;
+        } else if (c == '/' and i + 1 < out.len and out[i + 1] == '/') {
+            while (i < out.len and out[i] != '\n') : (i += 1) out[i] = ' ';
+        } else if (c == '/' and i + 1 < out.len and out[i + 1] == '*') {
+            out[i] = ' ';
+            out[i + 1] = ' ';
+            i += 2;
+            while (i < out.len) : (i += 1) {
+                if (out[i] == '*' and i + 1 < out.len and out[i + 1] == '/') {
+                    out[i] = ' ';
+                    out[i + 1] = ' ';
+                    i += 2;
+                    break;
+                }
+                out[i] = ' ';
+            }
+        } else {
+            i += 1;
+        }
+    }
+    return out;
 }
 
 /// Parse the first `"name"` string value from wrangler.jsonc bytes. Returns a
@@ -378,6 +426,21 @@ test "parseWorkerName: plain, JSONC comments, name after other keys, container n
     // absent / malformed
     try testing.expect(parseWorkerName("{ \"main\": \"x\" }") == null);
     try testing.expect(parseWorkerName("") == null);
+}
+
+test "stripJsoncComments + parseWorkerName ignores name in comments / string values" {
+    const gpa = testing.allocator;
+    const src =
+        \\{
+        \\  // "name": "commented-out",
+        \\  "main": "https://example.com/x", // a // inside a string is NOT a comment
+        \\  /* "name": "block-commented" */
+        \\  "name": "real-app"
+        \\}
+    ;
+    const clean = try stripJsoncComments(gpa, src);
+    defer gpa.free(clean);
+    try testing.expectEqualStrings("real-app", parseWorkerName(clean).?);
 }
 
 test "buildSecretsJson: branch DB URLs override base file; JSON-escaped; valid" {

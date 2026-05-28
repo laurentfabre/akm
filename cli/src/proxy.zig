@@ -143,7 +143,14 @@ const RequestHead = struct {
     content_length: ?u64,
     chunked: bool,
     is_upgrade: bool,
+    expect_continue: bool,
 };
+
+/// True if `s` contains a raw CR, LF, or NUL — none may appear inside a parsed
+/// request line or header value (embedded CR/LF is a header-injection vector).
+fn hasForbidden(s: []const u8) bool {
+    return std.mem.indexOfAny(u8, s, "\r\n\x00") != null;
+}
 
 /// True iff `list` (a comma-separated header value like `keep-alive, Upgrade`)
 /// contains `tok` as a whole, case-insensitive token — not a substring (so
@@ -168,6 +175,7 @@ fn isAllDigits(s: []const u8) bool {
 /// malformed/ambiguous Content-Length) so smuggling can't slip through.
 fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
     const request_line = try a.dupe(u8, trimCrlf(try r.takeDelimiterInclusive('\n')));
+    if (hasForbidden(request_line)) return error.BadRequest; // no embedded CR/LF/NUL
     var head_bytes: usize = request_line.len; // aggregate head size cap (see below)
     var rl = std.mem.tokenizeScalar(u8, request_line, ' ');
     const method = rl.next() orelse return error.BadRequest;
@@ -179,6 +187,7 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
     var has_te = false;
     var has_upgrade = false;
     var conn_upgrade = false;
+    var expect_continue = false;
 
     while (true) {
         const line = trimCrlf(try r.takeDelimiterInclusive('\n'));
@@ -189,6 +198,10 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = std.mem.trim(u8, line[0..colon], " \t");
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        // An embedded bare CR/LF/NUL in a header (the split is on '\n' only) would
+        // be reserialized upstream and could be read as a second header by a
+        // lenient parser — a header-injection / smuggling vector. Reject it.
+        if (hasForbidden(name) or hasForbidden(value)) return error.BadRequest;
 
         if (eqlIc(name, "content-length")) {
             // Content-Length must be 1*DIGIT (RFC 9112 §6.1). parseInt alone
@@ -217,6 +230,8 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
             if (hasToken(value, "upgrade")) conn_upgrade = true;
         } else if (eqlIc(name, "upgrade")) {
             has_upgrade = true;
+        } else if (eqlIc(name, "expect") and hasToken(value, "100-continue")) {
+            expect_continue = true;
         }
         try headers.append(a, .{ .name = try a.dupe(u8, name), .value = try a.dupe(u8, value) });
     }
@@ -241,6 +256,7 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
         .content_length = content_length,
         .chunked = chunked,
         .is_upgrade = is_upgrade,
+        .expect_continue = expect_continue,
     };
 }
 
@@ -278,6 +294,9 @@ fn serve(
         if (!is_upgrade and (eqlIc(h.name, "connection") or
             eqlIc(h.name, "keep-alive") or eqlIc(h.name, "proxy-connection")))
             continue;
+        // The proxy answers `Expect: 100-continue` itself (below); don't forward
+        // it upstream, where it would set up a second 100 handshake.
+        if (eqlIc(h.name, "expect")) continue;
         try fh.writer.print("{s}: {s}\r\n", .{ h.name, h.value });
     }
     if (to_backend) {
@@ -304,6 +323,13 @@ fn serve(
     const uw = &uw_state.interface;
 
     try uw.writeAll(fh.written());
+    // We stripped Expect from the upstream head and answer it ourselves: tell the
+    // client to send its body now, else an `Expect: 100-continue` client waits
+    // forever while we wait for the body (pinning the handler).
+    if (head.expect_continue and !is_upgrade) {
+        try cw.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
+        try cw.flush();
+    }
     if (!is_upgrade) {
         if (req_chunked) {
             try copyChunked(cr, uw);
@@ -571,6 +597,8 @@ test "parseRequestHead: rejects malformed/smuggling/oversized heads" {
     try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nTransfer-Encoding: xchunked\r\n\r\n"));
     try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"));
     try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"));
+    // embedded bare CR in a header value (header-injection / smuggling vector)
+    try testing.expectError(error.BadRequest, parseHeadTest(a, "GET / HTTP/1.1\r\nX-Foo: a\rContent-Length: 9\r\n\r\n"));
     // identical duplicate CL is tolerated (treated as one)
     const dup = try parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n");
     try testing.expectEqual(@as(?u64, 5), dup.content_length);
