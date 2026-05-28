@@ -213,19 +213,11 @@ fn shutdownChildren(io: std.Io, backend: *std.process.Child, vite: *std.process.
     if (vite.id != null) _ = vite.wait(io) catch {};
 }
 
-/// 32 random bytes for the ephemeral dev signing key. Seeds a CSPRNG from the
-/// wall clock and a stack address — dev-only, never used in production.
+/// 32 random bytes for the ephemeral dev signing key, from the OS CSPRNG
+/// (`io.random`, seeded by OS entropy). Dev-only and process-local.
 fn devRandomBytes(io: std.Io) [32]u8 {
-    var seed: [32]u8 = undefined;
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
-    const nanos = std.Io.Clock.now(.real, io).nanoseconds;
-    h.update(std.mem.asBytes(&nanos));
-    const stack_addr = @intFromPtr(&seed);
-    h.update(std.mem.asBytes(&stack_addr));
-    h.final(&seed);
-    var csprng = std.Random.DefaultCsprng.init(seed);
     var out: [32]u8 = undefined;
-    csprng.random().bytes(&out);
+    io.random(&out);
     return out;
 }
 
@@ -278,14 +270,23 @@ fn installSignalHandlers() void {
 }
 
 /// Poll the stop flag; once set, wake the proxy's blocked `accept` with a
-/// throwaway local connection.
+/// throwaway local connection. Retries the connect: a single failed self-connect
+/// must not leave `accept` blocked forever (that would deadlock shutdown).
 fn watcher(io: std.Io, proxy_port: u16) void {
     while (!should_stop.load(.acquire)) {
         io.sleep(std.Io.Duration.fromMilliseconds(200), .awake) catch {};
     }
     const addr = net.IpAddress.parse("127.0.0.1", proxy_port) catch return;
-    const s = addr.connect(io, .{ .mode = .stream }) catch return;
-    s.close(io);
+    var attempt: usize = 0;
+    while (attempt < 50) : (attempt += 1) {
+        if (addr.connect(io, .{ .mode = .stream })) |s| {
+            s.close(io);
+            return; // accept woke; it will observe should_stop and break
+        } else |_| {
+            io.sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+        }
+    }
+    std.log.warn("akm dev: could not wake the proxy accept loop to shut down", .{});
 }
 
 // ── arg parsing & banner ─────────────────────────────────────────────────────

@@ -25,6 +25,10 @@ const IpAddress = net.IpAddress;
 /// far beyond any realistic header block.
 const buf_size = 32 * 1024;
 
+/// Upper bound on header lines per request/response — bounds the parse loop
+/// against a client/upstream that streams headers forever (arena OOM).
+const max_headers = 200;
+
 pub const Config = struct {
     proxy_port: u16,
     backend_port: u16,
@@ -37,6 +41,11 @@ pub const Config = struct {
 /// Listen on 127.0.0.1:proxy_port and serve until `stop` is set. The caller is
 /// responsible for waking a blocked `accept` (e.g. a self-connect) after setting
 /// `stop`; we re-check the flag on every accepted connection.
+// Concurrency note: each connection is handled on its own OS thread sharing the
+// process `io` handle. This is sound for the standard threaded `Io` (the default
+// from `std.process.Init`), which serves blocking ops per-thread on independent
+// fds; it would NOT be sound under a single-threaded event-loop `Io`. akm always
+// runs on the threaded `Io`.
 pub fn run(io: std.Io, cfg: Config, stop: *std.atomic.Value(bool)) !void {
     const addr = IpAddress.parse("127.0.0.1", cfg.proxy_port) catch unreachable;
     var server = addr.listen(io, .{ .reuse_address = true }) catch |err| {
@@ -82,7 +91,10 @@ fn connThread(io: std.Io, cfg: Config, client: net.Stream) void {
 
     serve(io, cfg, arena.allocator(), client, cr, cw) catch |err| switch (err) {
         // A client that hangs up mid-request is normal; don't log it.
-        error.EndOfStream, error.ReadFailed, error.WriteFailed => {},
+        error.EndOfStream => {},
+        // A broken pipe mid-relay is usually a hangup too, but during bring-up
+        // it can also be a real relay defect — keep it visible at debug level.
+        error.ReadFailed, error.WriteFailed => std.log.debug("akm dev: relay io error: {s}", .{@errorName(err)}),
         else => std.log.warn("akm dev: request error: {s}", .{@errorName(err)}),
     };
     cw.flush() catch {};
@@ -117,12 +129,15 @@ fn serve(
     while (true) {
         const line = trimCrlf(try cr.takeDelimiterInclusive('\n'));
         if (line.len == 0) break;
+        if (headers.items.len >= max_headers) return error.TooManyHeaders; // bound the loop
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = std.mem.trim(u8, line[0..colon], " \t");
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
 
         if (eqlIc(name, "content-length")) {
-            req_content_length = std.fmt.parseInt(u64, value, 10) catch null;
+            // A present-but-malformed Content-Length must fail, not silently
+            // become "no length" (that's a request-smuggling primitive).
+            req_content_length = std.fmt.parseInt(u64, value, 10) catch return error.BadRequest;
         } else if (eqlIc(name, "transfer-encoding") and containsIc(value, "chunked")) {
             req_chunked = true;
         } else if (eqlIc(name, "connection") and containsIc(value, "upgrade")) {
@@ -135,6 +150,9 @@ fn serve(
             .value = try a.dupe(u8, value),
         });
     }
+    // RFC 9112 §6.1: Transfer-Encoding + Content-Length together is a smuggling
+    // vector — reject rather than guess which framing wins.
+    if (req_chunked and req_content_length != null) return error.BadRequest;
     const is_upgrade = has_upgrade and conn_upgrade;
 
     // ── build the rewritten head for the upstream ─────────────────────────
@@ -188,15 +206,27 @@ fn serve(
     // ── relay response ────────────────────────────────────────────────────
     const status_line = try ur.takeDelimiterInclusive('\n');
     const status = parseStatus(status_line);
+    if (status == 0) {
+        // Upstream sent an unparseable status line — emit a clean 502 rather
+        // than relaying a head we don't understand (framing-desync surface).
+        try cw.print(
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nakm dev: malformed upstream response\n",
+            .{},
+        );
+        return;
+    }
     try cw.writeAll(status_line);
 
     var resp_content_length: ?u64 = null;
     var resp_chunked = false;
+    var resp_headers: usize = 0;
     while (true) {
         const line = try ur.takeDelimiterInclusive('\n');
         try cw.writeAll(line);
         const t = trimCrlf(line);
         if (t.len == 0) break;
+        resp_headers += 1;
+        if (resp_headers > max_headers) return error.TooManyHeaders; // bound the loop
         const colon = std.mem.indexOfScalar(u8, t, ':') orelse continue;
         const name = std.mem.trim(u8, t[0..colon], " \t");
         const value = std.mem.trim(u8, t[colon + 1 ..], " \t");

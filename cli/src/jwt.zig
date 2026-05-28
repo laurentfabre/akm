@@ -49,6 +49,9 @@ pub const Minter = struct {
         now: i64,
     ) ![]u8 {
         std.debug.assert((kind == .user) == (email != null));
+        // The key crosses the trust boundary to the backend; a trivially short
+        // HMAC key would make forgery cheap. Reject it loudly.
+        std.debug.assert(self.key.len >= 16);
 
         const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
 
@@ -119,7 +122,7 @@ fn b64urlDecode(gpa: std.mem.Allocator, seg: []const u8) ![]u8 {
 
 test "mint produces three b64url segments with valid HMAC" {
     const gpa = testing.allocator;
-    const m = Minter{ .key = "dev-secret" };
+    const m = Minter{ .key = "dev-secret-key-0123456789" };
     const tok = try m.mint(gpa, "dev@akm.local", .user, "dev@akm.local", 1_700_000_000);
     defer gpa.free(tok);
 
@@ -140,7 +143,7 @@ test "mint produces three b64url segments with valid HMAC" {
 
 test "user payload carries email and required claims" {
     const gpa = testing.allocator;
-    const m = Minter{ .key = "k" };
+    const m = Minter{ .key = "test-key-0123456789ab" };
     const tok = try m.mint(gpa, "dev@akm.local", .user, "dev@akm.local", 1000);
     defer gpa.free(tok);
 
@@ -162,7 +165,7 @@ test "user payload carries email and required claims" {
 
 test "service token omits email" {
     const gpa = testing.allocator;
-    const m = Minter{ .key = "k" };
+    const m = Minter{ .key = "test-key-0123456789ab" };
     const tok = try m.mint(gpa, "svc:ci", .service, null, 1000);
     defer gpa.free(tok);
 

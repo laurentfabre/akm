@@ -199,6 +199,12 @@ fn fetchAndWrite(
     for (item.files) |f| {
         const dest = try mapPath(gpa, f.path);
         defer gpa.free(dest);
+        // Registry content is network input — never let it write outside the app.
+        if (isUnsafeRel(dest)) {
+            say2("akm components: refusing unsafe path ", dest);
+            say("\n");
+            continue;
+        }
         if (std.fs.path.dirnamePosix(dest)) |d| try proj.createDirPath(io, d);
         try proj.writeFile(io, .{ .sub_path = dest, .data = f.content });
         say2("  + ", dest);
@@ -230,6 +236,14 @@ fn mapPath(gpa: std.mem.Allocator, registry_path: []const u8) ![]u8 {
     const rest = p[slash + 1 ..];
     const mapped: []const u8 = if (std.mem.eql(u8, top, "ui")) "components/ui" else top; // others pass through
     return std.fmt.allocPrint(gpa, "ui/{s}/{s}", .{ mapped, rest });
+}
+
+/// Reject absolute paths and any `..` component (path traversal).
+fn isUnsafeRel(p: []const u8) bool {
+    if (std.fs.path.isAbsolute(p)) return true;
+    var it = std.mem.splitScalar(u8, p, '/');
+    while (it.next()) |seg| if (std.mem.eql(u8, seg, "..")) return true;
+    return false;
 }
 
 fn httpGetJson(gpa: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
@@ -507,6 +521,13 @@ test "RegistryItem parse with unknown fields ignored" {
     try testing.expectEqualStrings("button", parsed.value.name);
     try testing.expectEqual(@as(usize, 1), parsed.value.dependencies.len);
     try testing.expectEqualStrings("ui/button.tsx", parsed.value.files[0].path);
+}
+
+test "isUnsafeRel rejects traversal and absolute paths" {
+    try testing.expect(!isUnsafeRel("ui/components/ui/button.tsx"));
+    try testing.expect(isUnsafeRel("ui/../../etc/passwd"));
+    try testing.expect(isUnsafeRel("/etc/passwd"));
+    try testing.expect(isUnsafeRel(".."));
 }
 
 test "dirArg picks the non-flag" {
