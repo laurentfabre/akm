@@ -56,6 +56,13 @@ Round-3 auth verdict: SHIP, fully clean. Tests after fixes: 54 unit green.
 - **R4-7 (MINOR)** test scripts spliced `$APP`/`$WORK` into `bash -c`/`node -e`. ✅ pass paths via argv (`expect_fail_in`, `process.argv`, `bash -c '… "$1"' _ "$APP"`).
 Round-4 auth verdict: SHIP, clean. Tests after fixes: 55 unit green.
 
+## Round 5 (re-audit) — auth + cmds SHIP; 1 MAJOR + repeated MINORs, all fixed
+- **R5-1 (MAJOR, regression from R4-4)** dev `--neon-branch` name `akm-dev-{seconds}` could collide between two same-second runs; the loser's create fails on conflict and the by-name cleanup then deletes the WINNER's live branch. ✅ collision-resistant name (`akm-dev-{seconds}-{random hex}`) → no clash + by-name delete only targets our own.
+- **R5-2 (MINOR)** proxy TE used substring match (`xchunked`, `chunked, gzip` slipped). ✅ accept only an exact sole `chunked`; reject multiple TE headers.
+- **R5-3 (MINOR)** components size cap was post-hoc. ✅ stream into a fixed pre-capped 2MiB buffer (overflow → fetch error).
+- **R5-4 (MINOR)** p0-deploy rewrite had a brief mode window. ✅ mktemp (0600) + atomic mv.
+Round-5 verdict: auth SHIP, cmds SHIP, core SHIP-with-fixes (no BLOCKER). Tests after fixes: 55 unit / 52 e2e / 10 dev-smoke.
+
 ## MINOR (FIX cheap ones)
 - **N1 `.dev.vars` NUL → panic** (project.zig parseVars) — invalid key/value bytes panic `Environ.Map.put`. Validate keys, reject NUL, error with line number.
 - **N2 Dockerfile runs as root** — add a non-root `USER` before `CMD`.

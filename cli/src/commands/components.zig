@@ -261,14 +261,18 @@ fn httpGetJson(gpa: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
     }
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
-    var body: std.Io.Writer.Allocating = .init(gpa);
-    errdefer body.deinit();
+    // Stream into a FIXED, pre-capped buffer: memory can't grow past the cap
+    // (a post-hoc length check would let an unbounded body OOM us first). A body
+    // that overflows the buffer surfaces as a write error from fetch.
+    const buf = try gpa.alloc(u8, max_registry_bytes);
+    defer gpa.free(buf);
+    var body = std.Io.Writer.fixed(buf);
     const res = client.fetch(.{
         .location = .{ .url = url },
-        .response_writer = &body.writer,
+        .response_writer = &body,
         .redirect_behavior = .not_allowed, // no redirect-based SSRF
     }) catch |err| {
-        say2("akm components: registry fetch failed: ", @errorName(err));
+        say2("akm components: registry fetch failed (or response > cap): ", @errorName(err));
         say("\n");
         return err;
     };
@@ -277,8 +281,7 @@ fn httpGetJson(gpa: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
         say("\n");
         return error.HttpStatus;
     }
-    if (body.written().len > max_registry_bytes) return error.RegistryResponseTooLarge;
-    return body.toOwnedSlice();
+    return gpa.dupe(u8, body.buffered());
 }
 
 fn readStyle(gpa: std.mem.Allocator, io: std.Io, proj: std.Io.Dir) ![]u8 {

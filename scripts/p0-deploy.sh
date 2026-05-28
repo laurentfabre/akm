@@ -107,7 +107,11 @@ if [ -f .prod.vars ] && [ "$FORCE_PRODVARS" != 1 ]; then
 else
   KEY="$(openssl rand -hex 32)"
   umask 077
-  cat > .prod.vars <<EOF
+  # Write to a fresh mktemp file (created 0600 under the umask) and atomically
+  # mv it into place. Writing `cat > .prod.vars` directly would expose secrets in
+  # a pre-existing 0644 file during the window before chmod.
+  tmp="$(mktemp .prod.vars.XXXXXX)"
+  cat > "$tmp" <<EOF
 # akm P0 secrets — gitignored. Generated $(date -u +%FT%TZ).
 AKM_INTERNAL_JWT_KEY="$KEY"
 DATABASE_URL="$POOLED"
@@ -115,6 +119,7 @@ DATABASE_URL_DIRECT="$DIRECT"
 CF_ACCESS_TEAM_DOMAIN="${CF_ACCESS_TEAM_DOMAIN:-CHANGEME-your-team}"
 CF_ACCESS_AUD="${CF_ACCESS_AUD:-CHANGEME-access-app-aud-tag}"
 EOF
+  mv "$tmp" .prod.vars
   ok "wrote .prod.vars"
 fi
 # Always tighten the mode — `umask` only covers newly-created files, so a

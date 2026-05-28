@@ -89,8 +89,16 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
             return error.MissingNeonProject;
         };
         neon_pid = try gpa.dupe(u8, project_id);
+        // Collision-resistant name (timestamp + random): two `akm dev --neon-branch`
+        // started in the same second must NOT share a name — otherwise the loser's
+        // create fails on conflict and the by-name cleanup below would delete the
+        // winner's live branch. A unique name also means by-name delete on failure
+        // only ever targets our own branch.
+        const rnd_hex = std.fmt.bytesToHex(devRandomBytes(io)[0..6].*, .lower);
         var name_buf: [64]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "akm-dev-{d}", .{std.Io.Clock.now(.real, io).toSeconds()}) catch "akm-dev";
+        const name = std.fmt.bufPrint(&name_buf, "akm-dev-{d}-{s}", .{
+            std.Io.Clock.now(.real, io).toSeconds(), &rnd_hex,
+        }) catch "akm-dev";
         say2("akm dev: creating Neon branch ", name);
         say(" …\n");
         branch = neon.create(gpa, io, neon_pid.?, name) catch |err| {

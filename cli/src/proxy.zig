@@ -194,8 +194,13 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
                 if (existing != parsed) return error.BadRequest;
             } else content_length = parsed;
         } else if (eqlIc(name, "transfer-encoding")) {
-            has_te = true; // ANY TE alongside Content-Length is a smuggling vector
-            if (containsIc(value, "chunked")) chunked = true;
+            // `chunked` (exactly, as the sole coding) is all the proxy frames.
+            // Reject multiple TE headers and any value that isn't exactly
+            // `chunked` (e.g. `gzip`, `xchunked`, `chunked, gzip`) — substring
+            // matching here would be a parser-differential smuggling surface.
+            if (has_te) return error.BadRequest; // multiple Transfer-Encoding headers
+            has_te = true;
+            chunked = eqlIc(value, "chunked");
         } else if (eqlIc(name, "connection") and containsIc(value, "upgrade")) {
             conn_upgrade = true;
         } else if (eqlIc(name, "upgrade")) {
@@ -534,6 +539,10 @@ test "parseRequestHead: rejects malformed/smuggling/oversized heads" {
     // Content-Length must be bare digits — a sign is a parser-differential vector
     try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\n"));
     try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: -0\r\n\r\n"));
+    // Transfer-Encoding must be exactly `chunked` — substrings/lists/dupes rejected
+    try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nTransfer-Encoding: xchunked\r\n\r\n"));
+    try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"));
+    try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"));
     // identical duplicate CL is tolerated (treated as one)
     const dup = try parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n");
     try testing.expectEqual(@as(?u64, 5), dup.content_length);
