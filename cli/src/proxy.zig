@@ -278,7 +278,11 @@ fn serve(
     const req_chunked = head.chunked;
     const is_upgrade = head.is_upgrade;
 
-    const to_backend = std.mem.startsWith(u8, target, "/api");
+    // Match the production contract exactly: the Worker routes `/api/*`
+    // (wrangler `run_worker_first: ["/api/*"]`, `pathname.startsWith("/api/")`).
+    // Using `/api` here would send e.g. `/api-status` to the backend in dev but
+    // to assets in prod — a dev/prod routing differential.
+    const to_backend = std.mem.startsWith(u8, target, "/api/");
     const upstream_port = if (to_backend) cfg.backend_port else cfg.vite_port;
 
     // ── build the rewritten head for the upstream ─────────────────────────

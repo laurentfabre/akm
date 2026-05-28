@@ -373,7 +373,11 @@ fn isSafeDepSpec(p: []const u8) bool {
 fn npmInstall(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, pkgs: []const []const u8) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    try argv.appendSlice(gpa, &.{ "npm", "install" });
+    // `--ignore-scripts`: these package names come from the remote shadcn
+    // registry. Even restricted to registry sources, an attacker-named package
+    // could run a `postinstall` on the dev machine — shadcn/Radix/Tailwind are
+    // plain JS and need no lifecycle scripts, so disable them.
+    try argv.appendSlice(gpa, &.{ "npm", "install", "--ignore-scripts" });
     // Package specs include strings from the shadcn registry's
     // registryDependencies (untrusted). Reject anything that could be parsed as
     // an npm flag (leading `-`) or that isn't a plausible package spec, so a

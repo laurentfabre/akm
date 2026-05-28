@@ -76,6 +76,15 @@ Round-6 verdict: auth SHIP, core SHIP, cmds SHIP. Tests after fixes: 56 unit / 5
 - **R7-4 (MINOR)** proxy: `Expect: 100-continue` stalled a handler. ✅ proxy answers `100 Continue` itself and strips `Expect` from the upstream head.
 Round-7 verdict: auth SHIP; core/cmds fixed. Tests after fixes: 57 unit / 52 e2e / 10 dev-smoke.
 
+## Round 8 (re-audit) — auth SHIP; deeper edge cases, fixed (2 MINORs deferred w/ rationale)
+- **R8-1 (MAJOR)** preview: round-7 `parseWorkerName` still took the *first* `"name"` at any depth (a nested `vars`/`containers` name could win). ✅ depth-aware parse — only the top-level (depth-1) `name` key.
+- **R8-2 (MAJOR)** dev: the same secret env (DB URLs, JWT key) was handed to **Vite** too → a malicious Vite plugin/dep could exfiltrate it. ✅ Vite gets a separate secret-free env; only the backend gets secrets.
+- **R8-3 (MAJOR)** components: a compromised registry could name an arbitrary npm package whose `postinstall` runs. ✅ `npm install --ignore-scripts` for registry-derived deps.
+- **R8-4 (MINOR)** proxy routed `/api` but prod routes `/api/` → dev/prod differential. ✅ match `/api/` exactly.
+- **R8-5 (MINOR)** tsconfig didn't include `ui/`, so `frontend typecheck` skipped the UI. ✅ include `ui` — which surfaced a **real latent type error** in `ui/main.tsx` (untyped `fetch().json()`), now fixed with a typed cast.
+- **Deferred (MINOR, accepted)**: proxy per-connection read deadline (dev-only localhost, already bounded by the 256-connection cap) and neonctl unbounded output/timeout (trusted local CLI, KB-sized output) — both low-real-risk and need nontrivial Io timer/limit plumbing; not worth the churn/regression risk.
+Round-8 verdict: auth SHIP; fixes verified 57 unit / 52 e2e / 10 dev-smoke.
+
 ## MINOR (FIX cheap ones)
 - **N1 `.dev.vars` NUL → panic** (project.zig parseVars) — invalid key/value bytes panic `Environ.Map.put`. Validate keys, reject NUL, error with line number.
 - **N2 Dockerfile runs as root** — add a non-root `USER` before `CMD`.

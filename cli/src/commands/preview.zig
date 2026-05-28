@@ -294,16 +294,65 @@ fn stripJsoncComments(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
     return out;
 }
 
-/// Parse the first `"name"` string value from wrangler.jsonc bytes. Returns a
-/// slice into `bytes` (no allocation), or null if absent/malformed. The first
-/// `"name"` is the top-level Worker name (it precedes the container's name in
-/// the template) — robust to JSONC `//` comments since it scans raw text.
+/// Find the TOP-LEVEL (depth-1) `"name"` string value in comment-free JSON(C)
+/// bytes. Depth-aware so a nested `"vars": {"name": …}` or `containers[].name`
+/// (both present in the template, possibly before the top-level key) can't be
+/// mistaken for the Worker name. Returns a slice into `bytes`, or null.
 fn parseWorkerName(bytes: []const u8) ?[]const u8 {
-    const key = std.mem.indexOf(u8, bytes, "\"name\"") orelse return null;
-    const colon = std.mem.indexOfScalarPos(u8, bytes, key, ':') orelse return null;
-    const q1 = std.mem.indexOfScalarPos(u8, bytes, colon, '"') orelse return null;
-    const q2 = std.mem.indexOfScalarPos(u8, bytes, q1 + 1, '"') orelse return null;
-    return bytes[q1 + 1 .. q2];
+    var i: usize = 0;
+    var depth: usize = 0;
+    while (i < bytes.len) {
+        switch (bytes[i]) {
+            '{', '[' => {
+                depth += 1;
+                i += 1;
+            },
+            '}', ']' => {
+                if (depth > 0) depth -= 1;
+                i += 1;
+            },
+            '"' => {
+                const s = readJsonString(bytes, &i) orelse return null; // advances i past closing quote
+                if (depth == 1 and std.mem.eql(u8, s, "name")) {
+                    skipWs(bytes, &i);
+                    if (i < bytes.len and bytes[i] == ':') {
+                        i += 1;
+                        skipWs(bytes, &i);
+                        if (i < bytes.len and bytes[i] == '"') return readJsonString(bytes, &i);
+                    }
+                }
+            },
+            else => i += 1,
+        }
+    }
+    return null;
+}
+
+/// Parse a JSON string starting at the opening quote `bytes[i.*]=='"'`. Returns
+/// the raw inner slice and advances `i` past the closing quote; null if
+/// unterminated. (Escapes aren't decoded — fine for matching keys/slug values.)
+fn readJsonString(bytes: []const u8, i: *usize) ?[]const u8 {
+    const start = i.* + 1;
+    var j = start;
+    while (j < bytes.len) {
+        if (bytes[j] == '\\') {
+            j += 2;
+            continue;
+        }
+        if (bytes[j] == '"') {
+            i.* = j + 1;
+            return bytes[start..j];
+        }
+        j += 1;
+    }
+    return null;
+}
+
+fn skipWs(bytes: []const u8, i: *usize) void {
+    while (i.* < bytes.len) : (i.* += 1) switch (bytes[i.*]) {
+        ' ', '\t', '\n', '\r' => {},
+        else => return,
+    };
 }
 
 fn writePair(w: *std.Io.Writer, first: *bool, key: []const u8, value: []const u8) !void {
@@ -406,24 +455,20 @@ test "parseArgs requires action + pr" {
     try testing.expectError(error.UnknownFlag, parseArgs(&.{ "create", "--pr", "1", "--bogus" }));
 }
 
-test "parseWorkerName: plain, JSONC comments, name after other keys, container name ignored" {
+test "parseWorkerName reads only the TOP-LEVEL name (ignores nested)" {
     try testing.expectEqualStrings("acme", parseWorkerName(
         \\{ "name": "acme", "main": "src/worker/index.ts" }
     ).?);
-    // tolerant of // comments and whitespace
+    // nested name(s) appearing BEFORE the top-level key must NOT be picked
     try testing.expectEqualStrings("acme", parseWorkerName(
-        \\// wrangler config
-        \\{
-        \\  "compatibility_date": "2026-01-01",
-        \\  "name": "acme"
-        \\}
+        \\{ "vars": { "name": "nested" }, "containers": [ { "name": "acme-backend" } ], "name": "acme" }
     ).?);
-    // the *first* "name" is the top-level Worker name; the container's name
-    // block comes later in the template and must NOT be picked.
+    // top-level name before a nested container name also works
     try testing.expectEqualStrings("acme", parseWorkerName(
         \\{ "name": "acme", "containers": [{ "name": "acme-backend" }] }
     ).?);
-    // absent / malformed
+    // no top-level name (only nested) → null
+    try testing.expect(parseWorkerName("{ \"vars\": { \"name\": \"x\" } }") == null);
     try testing.expect(parseWorkerName("{ \"main\": \"x\" }") == null);
     try testing.expect(parseWorkerName("") == null);
 }
