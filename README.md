@@ -26,6 +26,7 @@ What works today — the full local lifecycle:
 | `akm deploy [dir]` | build → secrets (`wrangler secret bulk`) → `wrangler deploy`; `--dry-run`, `--migrate`, `--env` |
 | `akm logs [dir]` | live Worker tail (`wrangler tail`); container logs → Observability dashboard (§5 caveat printed) |
 | `akm components init \| add <name…>` | make the app shadcn-ready, then fetch shadcn/ui components over HTTPS |
+| `akm frontend install \| add \| dev \| build \| typecheck` | UI-only npm/Vite toolchain — work on the frontend in isolation (`frontend dev` = Vite alone, no proxy; `frontend build` = `vite build` only, no codegen) |
 | `akm preview create \| destroy --pr <id>` | per-PR named Worker + ephemeral Neon branch (CI calls these on PR open/close) |
 
 ## Build
@@ -87,6 +88,7 @@ cli/
       deploy.zig        wrangler deploy + secret bulk + alembic migrate
       logs.zig          wrangler tail live Worker tail + §5 container-log caveat
       components.zig    shadcn registry fetch/add over HTTPS + shadcn-ready init
+      frontend.zig      UI-only npm/Vite toolchain wrapper (install/add/dev/build/typecheck)
       preview.zig       per-PR named Worker + ephemeral Neon branch (create/destroy)
   templates/base/       the generated-app templates (Worker, Container, FastAPI, Neon, Alembic)
 ```

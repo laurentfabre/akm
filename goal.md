@@ -132,7 +132,7 @@ graph LR
 | `deploy` | ✅ built | build → optional `--migrate` (alembic) → optional `--secrets` (`wrangler secret bulk` via stdin) → `wrangler deploy`; `--dry-run`/`--env`. Real-path unverified against cloud (by choice) |
 | `logs` | ✅ built | wrap `wrangler tail` (live Worker tail) + print the §5 caveat (container logs → Observability dashboard); `--env`/`--format` |
 | `components` | ✅ built | shadcn registry fetch/add over HTTPS (`std.http.Client`) + file writes; `init` makes the app shadcn-ready (Tailwind v4 + `cn` + `@/` alias); `add <name…>` resolves registryDependencies + installs npm deps |
-| `frontend` | planned | thin wrapper over Bun/Vite/npm |
+| `frontend` | ✅ built | thin wrapper over the npm/Vite toolchain — UI-only escape hatch: `install`/`add <pkg…> [--dev]`/`dev`/`build`/`typecheck`. Complements (does not duplicate) `akm dev`/`akm build`: `frontend dev` is Vite-only (no proxy/identity), `frontend build` is `vite build` only (no codegen) |
 | `preview` | ✅ built | per-PR preview: named Worker `{base}-pr-{id}` via `wrangler deploy --name` + ephemeral Neon branch `akm-pr-{id}`; `create`/`destroy` for CI (no native preview URL for DO/Container Workers, §5) |
 | `mcp` | v2 | JSON-RPC over stdio in Zig |
 
@@ -219,7 +219,7 @@ The single contract, in strict order:
 
 | Objection | Response |
 |---|---|
-| **"A Zig *binary* is overkill — a template repo + a few shell scripts captures most of the value with far less maintenance."** (the strongest whole-approach objection) | Taken seriously, and **not** defended with a "dependency-free install" claim — that would be false, since the binary shells out to Bun/Vite, `openapi-typescript`, Python/`uv`/`uvicorn`, Wrangler, Docker, and the Neon CLI/API. Those toolchains are still required. The binary's only honest value is as a **single-entry orchestrator**: one command that sequences the multi-process `dev` loop (proxy + mock-identity JWT + Vite + uvicorn + Neon-branch lifecycle + watch), the build graph (codegen → vite → Docker → wrangler), and per-PR env/branch wiring — replacing an error-prone pile of shell glue. **Decision gate at end of P2:** if that orchestration doesn't clearly beat a `package.json`-scripts + `wrangler`/`vite` template, we ship the template and **cancel the Zig binary.** The binary is a means, not a requirement. |
+| **"A Zig *binary* is overkill — a template repo + a few shell scripts captures most of the value with far less maintenance."** (the strongest whole-approach objection) | Taken seriously, and **not** defended with a "dependency-free install" claim — that would be false, since the binary shells out to Bun/Vite, `openapi-typescript`, Python/`uv`/`uvicorn`, Wrangler, Docker, and the Neon CLI/API. Those toolchains are still required. The binary's only honest value is as a **single-entry orchestrator**: one command that sequences the multi-process `dev` loop (proxy + mock-identity JWT + Vite + uvicorn + Neon-branch lifecycle + watch), the build graph (codegen → vite → Docker → wrangler), and per-PR env/branch wiring — replacing an error-prone pile of shell glue. **Decision gate at end of P2:** if that orchestration doesn't clearly beat a `package.json`-scripts + `wrangler`/`vite` template, we ship the template and **cancel the Zig binary.** The binary is a means, not a requirement. **→ RESOLVED 2026-05-28: QUALIFIED KEEP — see §11.** |
 | "Why not embed Python in the binary for speed?" | §0: Cloudflare runs the Container; a Dockerfile + uvicorn already gives multi-worker serving. Embedding CPython buys nothing the platform doesn't already provide, and costs months. |
 | "Containers aren't edge; placement/cold-start/routing caveats." | Acknowledged in §2; no "edge-native FastAPI" claim. P0 measures cold start. Worker-only mode exists for genuinely edge-latency-sensitive light apps. |
 | "Container ↔ KV/R2/AI isn't direct from Python." | Correct (§4.5/§2): those bindings live on the Worker. The container reaches them via a Worker facade (HTTP) or explicit secret/env plumbing (e.g. R2 S3-API creds). Addons must ship that bridge or state "Worker-only." |
@@ -247,9 +247,27 @@ _Four adversarial Codex rounds, each fact-checked against live Cloudflare/Neon d
 - **Rev 3 — after Codex round 2** (0 BLOCKERs; 5 MAJORs). Resolved: single auth contract — Worker strips client identity, validates Access JWT, mints one internal `X-Akm-Identity` JWT, container validates only that, dev proxy mints the same (§4.5); binary value-prop honesty — orchestrator, not dependency-free (§8); OpenAPI build-mode import contract `AKM_OPENAPI_BUILD=1`, side-effect-light (§4); Neon prepared-statement wording corrected + pool resilience for scale-to-zero (§3); container-log claim downgraded to Observability-dashboard + P0 verification, `observability.enabled` added (§5); SPA `not_found_handling` fallback + prod-Access-app-required note (§5).
 - **Rev 4 — after Codex round 3** (verdict APPROVE-WITH-NITS; 6/7 majors fully resolved). Tightened the remaining auth nit: exact `X-Akm-Identity` JWT schema (HS256, `iss`/`aud`/`iat`/`nbf`/`exp≤120s`/`sub`/`kind`/`email?`) + validation checks; explicit ordering (validate Access JWT → then sanitize/strip headers → forward); service-token principal mapping from `common_name`/token-id with empty-`sub` handling (§4.5).
 - **Round 4 (confirmation):** verified all nits, judged §4.5 self-consistent and implementable as a security boundary, found no remaining Cloudflare/Neon factual error. Approved to execute.
+- **P2 gate resolved (2026-05-28):** post-build verdict on §8's cancel gate — **QUALIFIED KEEP** (full command-by-command analysis in §11). `dev` justifies the binary; `init`/`components` are acknowledged weak spots.
 
 ## 10. Definition of done
 1. This plan survives adversarial review with no unaddressed BLOCKER/MAJOR.
 2. Every subsystem in §1 has a concrete Cloudflare/Neon implementation or an explicit deferral.
 3. The Zig binary's scope is honestly bounded — including a gate that can cancel it.
 4. The §0 runtime thesis is stated with the correct rationale.
+5. The P2 decision gate (§8) is **resolved**, not just promised — see §11.
+
+## 11. P2 decision gate — resolved (2026-05-28)
+
+The §8 gate: *if the orchestration doesn't **clearly** beat a `package.json`-scripts + `wrangler`/`vite` template, ship the template and cancel the binary.* Tested command-by-command against that bar:
+
+| Command | Clearly beats template+scripts? | Why |
+|---|---|---|
+| `dev` | **Yes** | Mints `X-Akm-Identity` via the *exact* HS256 contract the prod Worker uses (`auth.ts`→`identity.py`), strips spoofable client headers, tunnels WS/HMR, manages uvicorn+Vite process groups with bounded shutdown, ties Neon-branch create/delete to the session. A shell+Vite-proxy setup needs a Node/Python minting helper to match the auth contract — exactly the drift-prone glue the binary removes. Live-verified. |
+| `preview` | Modest | Real atomic orchestration (branch→build→secrets→`--name` deploy), but shell-scriptable in ~40 lines. |
+| `deploy` | Marginal | Pure sequencing; secrets-via-stdin is a nicety a `cat \| wrangler secret bulk` matches. |
+| `build` | No | Pure sequencing — a `package.json` script is equivalent. |
+| `init` | **Loses** | Templates embedded in the binary → updating a template needs a rebuild+redistribute; a `gh repo --template`/`degit` template repo updates instantly and is canonical. |
+| `components` | **Loses** | Reimplements `npx shadcn add` (registry fetch + `registryDependencies` BFS); shadcn's own CLI is better-maintained. |
+| `logs` | No | Thin `wrangler tail` wrapper + caveat. |
+
+**Verdict: QUALIFIED KEEP.** The binary clears the bar on the strength of `dev` (auth-contract fidelity + the multi-process/Neon-branch loop as one verified atomic unit) and the value of a single coherent entry point across the lifecycle. Acknowledged weak spots, recorded as honesty not action items: `init` would be better as a template repo, and `components` duplicates the shadcn CLI — both rode in on the binary rather than justifying it. §8 already concedes the binary gives **no dependency-free win** (it shells out to Vite/wrangler/uv/Docker/neonctl), so single-entry orchestration is its only honest value — and `dev` delivers it. Because the binary is already built, hardened (2 review rounds + a TigerStyle defensive audit), and tested (43 tests), the gate's original "cancel to avoid wasted effort" rationale is moot; the live cost is only ongoing maintenance, which is low for a feature-complete tool absent further Zig `std` churn. **Decision: keep the binary; do not cancel.**

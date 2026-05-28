@@ -6,6 +6,7 @@ const deploy_cmd = @import("commands/deploy.zig");
 const components_cmd = @import("commands/components.zig");
 const logs_cmd = @import("commands/logs.zig");
 const preview_cmd = @import("commands/preview.zig");
+const frontend_cmd = @import("commands/frontend.zig");
 
 pub const version = "0.0.1";
 
@@ -29,6 +30,7 @@ const usage =
     \\  deploy [dir]    Build + push secrets + wrangler deploy (--dry-run to validate)
     \\  logs [dir]      Live Worker tail (wrangler tail; Observability for container logs)
     \\  components      Add shadcn/ui components (init | add <name…>)
+    \\  frontend        UI-only toolchain (install | add | dev | build | typecheck)
     \\  preview         Per-PR preview env (create | destroy --pr <id>)
     \\  version         Print version
     \\  help            Show this help
@@ -69,6 +71,8 @@ pub fn main(init: std.process.Init) !void {
         try logs_cmd.run(gpa, args[2..]);
     } else if (eql(cmd, "preview")) {
         try preview_cmd.run(gpa, args[2..]);
+    } else if (eql(cmd, "frontend")) {
+        try frontend_cmd.run(gpa, args[2..]);
     } else {
         say2("akm: unknown command '", cmd);
         say("'\n\n");
@@ -99,6 +103,7 @@ test {
     std.testing.refAllDecls(components_cmd);
     std.testing.refAllDecls(logs_cmd);
     std.testing.refAllDecls(preview_cmd);
+    std.testing.refAllDecls(frontend_cmd);
     std.testing.refAllDecls(@import("project.zig"));
     std.testing.refAllDecls(@import("proxy.zig"));
     std.testing.refAllDecls(@import("jwt.zig"));
