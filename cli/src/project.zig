@@ -133,6 +133,38 @@ pub fn baseChildEnv(gpa: std.mem.Allocator) !Environ.Map {
     return env;
 }
 
+/// Is `key` safe to pass to the frontend (Vite/npm) child? Default-DENY: only an
+/// allowlist of vars Vite legitimately needs passes, so secrets exported in the
+/// parent shell/CI/direnv (DATABASE_URL, AKM_INTERNAL_JWT_KEY, NEON_*, CF_*,
+/// cloud/API tokens, …) can never reach a Vite plugin/dev-dependency.
+pub fn isFrontendEnvKey(key: []const u8) bool {
+    const exact = [_][]const u8{
+        "PATH",    "HOME",    "USER",        "LOGNAME",     "SHELL",
+        "LANG",    "TERM",    "TZ",          "TMPDIR",      "TMP",
+        "TEMP",    "COLORTERM", "FORCE_COLOR", "CI",        "NODE_EXTRA_CA_CERTS",
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy",
+        "no_proxy",
+    };
+    for (exact) |k| if (std.mem.eql(u8, key, k)) return true;
+    // Intentional frontend vars + locale + npm config knobs.
+    const prefix = [_][]const u8{ "VITE_", "LC_", "npm_config_", "NPM_CONFIG_" };
+    for (prefix) |p| if (std.mem.startsWith(u8, key, p)) return true;
+    return false;
+}
+
+/// A frontend child env built from the parent env via `isFrontendEnvKey`
+/// (allowlist). Used for `akm dev`'s Vite process so it never inherits backend
+/// secrets. Caller deinits.
+pub fn frontendEnv(gpa: std.mem.Allocator) !Environ.Map {
+    var env = Environ.Map.init(gpa);
+    errdefer env.deinit();
+    var it = main.environ_map.array_hash_map.iterator();
+    while (it.next()) |e| {
+        if (isFrontendEnvKey(e.key_ptr.*)) try env.put(e.key_ptr.*, e.value_ptr.*);
+    }
+    return env;
+}
+
 test "parseVars is OOM-safe (no leak on allocation failure)" {
     const Fn = struct {
         fn run(a: std.mem.Allocator) !void {
@@ -165,6 +197,20 @@ test "parseVars rejects NUL bytes (would panic Environ.Map.put)" {
 test "parseVars rejects duplicate keys" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.DuplicateVar, parseVars(gpa, "DATABASE_URL=a\nDATABASE_URL=b\n"));
+}
+
+test "isFrontendEnvKey allowlists Vite needs and denies secrets" {
+    try std.testing.expect(isFrontendEnvKey("PATH"));
+    try std.testing.expect(isFrontendEnvKey("HOME"));
+    try std.testing.expect(isFrontendEnvKey("VITE_API_URL"));
+    try std.testing.expect(isFrontendEnvKey("npm_config_registry"));
+    // secrets (akm-injected or developer-exported) must NOT reach Vite
+    try std.testing.expect(!isFrontendEnvKey("DATABASE_URL"));
+    try std.testing.expect(!isFrontendEnvKey("DATABASE_URL_DIRECT"));
+    try std.testing.expect(!isFrontendEnvKey("AKM_INTERNAL_JWT_KEY"));
+    try std.testing.expect(!isFrontendEnvKey("NEON_API_KEY"));
+    try std.testing.expect(!isFrontendEnvKey("CF_ACCESS_AUD"));
+    try std.testing.expect(!isFrontendEnvKey("CLOUDFLARE_API_TOKEN"));
 }
 
 test "parseVars: comments, quotes, whitespace" {

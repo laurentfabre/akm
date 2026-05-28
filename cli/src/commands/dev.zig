@@ -157,11 +157,12 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     };
     const vite_argv = [_][]const u8{ "npm", "run", "dev", "--", "--port", vp, "--strictPort" };
 
-    // Vite gets a SEPARATE, secret-free env: only the backend needs the DB URLs
-    // and AKM_INTERNAL_JWT_KEY. A compromised Vite plugin/dev-dependency runs
-    // with this env, so it must not see DATABASE_URL/_DIRECT or the JWT key
-    // (especially the in-memory ephemeral --neon-branch credentials).
-    var vite_env = try project.baseChildEnv(gpa);
+    // Vite gets a SEPARATE, allowlist-built env (project.frontendEnv): only the
+    // backend needs the DB URLs and AKM_INTERNAL_JWT_KEY. A compromised Vite
+    // plugin/dev-dependency runs with this env, so it must see neither the secrets
+    // akm injects NOR secrets the developer exported in their shell/CI/direnv
+    // (default-deny — baseChildEnv would clone the whole parent env).
+    var vite_env = try project.frontendEnv(gpa);
     defer vite_env.deinit();
 
     // (Signal handlers were installed above, before the Neon branch / spawn.)

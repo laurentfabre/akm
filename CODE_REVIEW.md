@@ -85,6 +85,11 @@ Round-7 verdict: auth SHIP; core/cmds fixed. Tests after fixes: 57 unit / 52 e2e
 - **Deferred (MINOR, accepted)**: proxy per-connection read deadline (dev-only localhost, already bounded by the 256-connection cap) and neonctl unbounded output/timeout (trusted local CLI, KB-sized output) — both low-real-risk and need nontrivial Io timer/limit plumbing; not worth the churn/regression risk.
 Round-8 verdict: auth SHIP; fixes verified 57 unit / 52 e2e / 10 dev-smoke.
 
+## Round 9 (verification) — cmds CLEAN; one MAJOR: round-8 Vite isolation was incomplete
+- **R9-1 (MAJOR)** dev: round-8's `vite_env` used `baseChildEnv`, which clones the WHOLE parent env — so secrets the developer exported in their shell/CI/direnv (`DATABASE_URL`, `AKM_INTERNAL_JWT_KEY`, `NEON_*`, CF/cloud tokens) still reached Vite. A malicious Vite plugin could mint its own `X-Akm-Identity`. ✅ new `project.frontendEnv` builds Vite's env from an **allowlist** (default-deny: PATH/HOME/SHELL/locale/proxy/`VITE_*`/`npm_config_*` only). Verified: dev-smoke still serves Vite; `isFrontendEnvKey` unit-tested.
+- cmds round 9: CLEAN (all round-8 fixes verified). auth/core trust-boundary classes all reconfirmed clean.
+Round-9 verdict after fix: tests 58 unit / 52 e2e / 10 dev-smoke.
+
 ## MINOR (FIX cheap ones)
 - **N1 `.dev.vars` NUL → panic** (project.zig parseVars) — invalid key/value bytes panic `Environ.Map.put`. Validate keys, reject NUL, error with line number.
 - **N2 Dockerfile runs as root** — add a non-root `USER` before `CMD`.
