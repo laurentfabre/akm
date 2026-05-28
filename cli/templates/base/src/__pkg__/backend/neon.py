@@ -20,7 +20,7 @@ from collections.abc import Generator
 from contextlib import asynccontextmanager
 from typing import Annotated, AsyncGenerator, TypeAlias
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from sqlalchemy import Engine, create_engine, text
 from sqlmodel import Session
 
@@ -91,6 +91,17 @@ async def db_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         yield
         return
 
+    # Dev without a database: `akm dev` sets AKM_DEV=1 and may run with no Neon
+    # branch / DATABASE_URL. Start anyway so the UI and non-DB routes work; DB
+    # routes return 503 at request time (see _session). In production AKM_DEV is
+    # absent, so a missing DATABASE_URL still fails fast below — a misconfigured
+    # deploy should crash-loop visibly, not silently serve 503s.
+    if os.environ.get("AKM_DEV") == "1" and not settings.database_url:
+        logger.warning("AKM_DEV: no DATABASE_URL — starting without a database (DB routes will 503)")
+        app.state.engine = None
+        yield
+        return
+
     # Startup only *validates* the (pooled) connection. Schema is owned by Alembic
     # over the direct endpoint — never run DDL here: with multiple uvicorn workers
     # on PgBouncer transaction pooling, concurrent create_all() would race.
@@ -107,7 +118,8 @@ async def db_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def _session(request: Request) -> Generator[Session, None, None]:
     engine = request.app.state.engine
     if engine is None:
-        raise RuntimeError("DB engine unavailable (build mode?)")
+        # No engine = build mode or dev without a database (AKM_DEV, no DATABASE_URL).
+        raise HTTPException(status_code=503, detail="database not configured")
     with Session(bind=engine) as session:
         yield session
 
