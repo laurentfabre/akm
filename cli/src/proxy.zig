@@ -102,32 +102,36 @@ fn connThread(io: std.Io, cfg: Config, client: net.Stream) void {
 
 const Header = struct { name: []const u8, value: []const u8 };
 
-fn serve(
-    io: std.Io,
-    cfg: Config,
-    a: std.mem.Allocator,
-    client: net.Stream,
-    cr: *std.Io.Reader,
-    cw: *std.Io.Writer,
-) !void {
-    // ── request line ──────────────────────────────────────────────────────
-    const request_line = try a.dupe(u8, trimCrlf(try cr.takeDelimiterInclusive('\n')));
+/// The parsed HTTP request head. All slices are owned by the allocator passed to
+/// `parseRequestHead`; `method`/`target` point into `request_line`.
+const RequestHead = struct {
+    request_line: []const u8,
+    method: []const u8,
+    target: []const u8,
+    headers: []Header,
+    content_length: ?u64,
+    chunked: bool,
+    is_upgrade: bool,
+};
+
+/// Read and validate an HTTP/1.1 request head from `r`. Pure (no sockets): the
+/// reader can be a real connection or `std.Io.Reader.fixed(bytes)` in tests.
+/// Enforces the framing rules the proxy depends on (bounded headers, no
+/// malformed/ambiguous Content-Length) so smuggling can't slip through.
+fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
+    const request_line = try a.dupe(u8, trimCrlf(try r.takeDelimiterInclusive('\n')));
     var rl = std.mem.tokenizeScalar(u8, request_line, ' ');
     const method = rl.next() orelse return error.BadRequest;
     const target = rl.next() orelse return error.BadRequest;
 
-    const to_backend = std.mem.startsWith(u8, target, "/api");
-    const upstream_port = if (to_backend) cfg.backend_port else cfg.vite_port;
-
-    // ── request headers ───────────────────────────────────────────────────
     var headers: std.ArrayList(Header) = .empty;
-    var req_content_length: ?u64 = null;
-    var req_chunked = false;
+    var content_length: ?u64 = null;
+    var chunked = false;
     var has_upgrade = false;
     var conn_upgrade = false;
 
     while (true) {
-        const line = trimCrlf(try cr.takeDelimiterInclusive('\n'));
+        const line = trimCrlf(try r.takeDelimiterInclusive('\n'));
         if (line.len == 0) break;
         if (headers.items.len >= max_headers) return error.TooManyHeaders; // bound the loop
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
@@ -137,28 +141,56 @@ fn serve(
         if (eqlIc(name, "content-length")) {
             // A present-but-malformed Content-Length must fail, not silently
             // become "no length" (that's a request-smuggling primitive).
-            req_content_length = std.fmt.parseInt(u64, value, 10) catch return error.BadRequest;
+            content_length = std.fmt.parseInt(u64, value, 10) catch return error.BadRequest;
         } else if (eqlIc(name, "transfer-encoding") and containsIc(value, "chunked")) {
-            req_chunked = true;
+            chunked = true;
         } else if (eqlIc(name, "connection") and containsIc(value, "upgrade")) {
             conn_upgrade = true;
         } else if (eqlIc(name, "upgrade")) {
             has_upgrade = true;
         }
-        try headers.append(a, .{
-            .name = try a.dupe(u8, name),
-            .value = try a.dupe(u8, value),
-        });
+        try headers.append(a, .{ .name = try a.dupe(u8, name), .value = try a.dupe(u8, value) });
     }
     // RFC 9112 §6.1: Transfer-Encoding + Content-Length together is a smuggling
     // vector — reject rather than guess which framing wins.
-    if (req_chunked and req_content_length != null) return error.BadRequest;
-    const is_upgrade = has_upgrade and conn_upgrade;
+    if (chunked and content_length != null) return error.BadRequest;
+
+    return .{
+        .request_line = request_line,
+        .method = method,
+        .target = target,
+        .headers = try headers.toOwnedSlice(a),
+        .content_length = content_length,
+        .chunked = chunked,
+        .is_upgrade = has_upgrade and conn_upgrade,
+    };
+}
+
+fn serve(
+    io: std.Io,
+    cfg: Config,
+    a: std.mem.Allocator,
+    client: net.Stream,
+    cr: *std.Io.Reader,
+    cw: *std.Io.Writer,
+) !void {
+    // Parse the request head (pure + table-tested — see parseRequestHead).
+    const head = try parseRequestHead(a, cr);
+    const request_line = head.request_line;
+    const method = head.method;
+    const target = head.target;
+    const headers = head.headers;
+    const req_content_length = head.content_length;
+    const req_chunked = head.chunked;
+    const is_upgrade = head.is_upgrade;
+
+    const to_backend = std.mem.startsWith(u8, target, "/api");
+    const upstream_port = if (to_backend) cfg.backend_port else cfg.vite_port;
 
     // ── build the rewritten head for the upstream ─────────────────────────
     var fh: std.Io.Writer.Allocating = .init(a);
     try fh.writer.print("{s}\r\n", .{request_line});
-    for (headers.items) |h| {
+    for (headers) |h| {
         // §4.5: the backend never trusts client identity headers.
         if (to_backend and (startsWithIc(h.name, "cf-access-") or
             startsWithIc(h.name, "x-forwarded-") or startsWithIc(h.name, "x-akm-")))
@@ -394,4 +426,79 @@ test "header helpers are case-insensitive" {
 test "trimCrlf strips line endings only on the right" {
     try testing.expectEqualStrings("a: b", trimCrlf("a: b\r\n"));
     try testing.expectEqualStrings("", trimCrlf("\r\n"));
+}
+
+/// Parse `raw` with an arena so the test doesn't free each owned slice by hand.
+fn parseHeadTest(arena: std.mem.Allocator, raw: []const u8) !RequestHead {
+    var r = std.Io.Reader.fixed(raw);
+    return parseRequestHead(arena, &r);
+}
+
+test "parseRequestHead: valid GET, no body" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const h = try parseHeadTest(arena.allocator(), "GET /api/health HTTP/1.1\r\nHost: x\r\nAccept: */*\r\n\r\n");
+    try testing.expectEqualStrings("GET", h.method);
+    try testing.expectEqualStrings("/api/health", h.target);
+    try testing.expectEqual(@as(usize, 2), h.headers.len);
+    try testing.expect(h.content_length == null and !h.chunked and !h.is_upgrade);
+}
+
+test "parseRequestHead: Content-Length parsed; chunked detected; upgrade detected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cl = try parseHeadTest(a, "POST /api/x HTTP/1.1\r\nContent-Length: 7\r\n\r\n");
+    try testing.expectEqual(@as(?u64, 7), cl.content_length);
+    const ch = try parseHeadTest(a, "POST /api/x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+    try testing.expect(ch.chunked);
+    const up = try parseHeadTest(a, "GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+    try testing.expect(up.is_upgrade);
+}
+
+test "parseRequestHead: rejects malformed/smuggling/oversized heads" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // malformed Content-Length
+    try testing.expectError(error.BadRequest, parseHeadTest(a, "GET / HTTP/1.1\r\nContent-Length: abc\r\n\r\n"));
+    // CL + chunked together (smuggling)
+    try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"));
+    // request line with no target
+    try testing.expectError(error.BadRequest, parseHeadTest(a, "GET\r\n\r\n"));
+    // too many headers
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "GET / HTTP/1.1\r\n");
+    for (0..max_headers + 5) |i| try buf.appendSlice(a, try std.fmt.allocPrint(a, "H{d}: v\r\n", .{i}));
+    try buf.appendSlice(a, "\r\n");
+    try testing.expectError(error.TooManyHeaders, parseHeadTest(a, buf.items));
+}
+
+test "parseRequestHead: garbage input never crashes or leaks" {
+    // Poor-man's fuzz: feed many derived/truncated/garbled byte strings; the only
+    // contract is no crash and no leak (testing.allocator catches leaks).
+    const seeds = [_][]const u8{
+        "GET / HTTP/1.1\r\nContent-Length: 9\r\n\r\n",
+        "\r\n\r\n",
+        ": novalue\r\n\r\n",
+        "GET / HTTP/1.1\r\nX",
+        "PUT /a HTTP/1.1\r\nConnection: upgrade\r\n\r\n",
+    };
+    var prng = std.Random.DefaultPrng.init(0xA11CE);
+    const rnd = prng.random();
+    for (seeds) |seed| {
+        for (0..seed.len + 1) |cut| {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            // truncated prefix
+            _ = parseHeadTest(arena.allocator(), seed[0..cut]) catch {};
+            // a byte-flipped copy
+            var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena2.deinit();
+            const mut = arena2.allocator().dupe(u8, seed) catch continue;
+            if (mut.len > 0) mut[rnd.uintLessThan(usize, mut.len)] = rnd.int(u8);
+            _ = parseHeadTest(arena2.allocator(), mut) catch {};
+        }
+    }
 }
