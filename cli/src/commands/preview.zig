@@ -144,18 +144,8 @@ fn pushSecrets(gpa: std.mem.Allocator, io: std.Io, opts: Options, worker: []cons
         vars = try project.parseVars(gpa, bytes.?);
     }
 
-    var json: std.Io.Writer.Allocating = .init(gpa);
-    defer json.deinit();
-    try json.writer.writeByte('{');
-    var first = true;
-    for (vars) |v| {
-        // The PR branch owns the DB URLs; ignore any DB entries in the base file.
-        if (std.mem.eql(u8, v.key, "DATABASE_URL") or std.mem.eql(u8, v.key, "DATABASE_URL_DIRECT")) continue;
-        try writePair(&json.writer, &first, v.key, v.value);
-    }
-    try writePair(&json.writer, &first, "DATABASE_URL", br.pooled_url);
-    try writePair(&json.writer, &first, "DATABASE_URL_DIRECT", br.direct_url);
-    try json.writer.writeByte('}');
+    const body = try buildSecretsJson(gpa, vars, br.pooled_url, br.direct_url);
+    defer gpa.free(body);
 
     say("akm preview: uploading secrets (wrangler secret bulk) …\n");
     var child = std.process.spawn(io, .{
@@ -170,12 +160,36 @@ fn pushSecrets(gpa: std.mem.Allocator, io: std.Io, opts: Options, worker: []cons
         return err;
     };
     if (child.stdin) |stdin| {
-        stdin.writeStreamingAll(io, json.written()) catch {};
+        stdin.writeStreamingAll(io, body) catch {};
         stdin.close(io);
         child.stdin = null;
     }
     const term = try child.wait(io);
     if (term != .exited or term.exited != 0) return error.SecretsFailed;
+}
+
+/// Build the `wrangler secret bulk` JSON body: every base-file var EXCEPT the
+/// DB URLs (the PR branch owns those), then the branch's pooled/direct URLs.
+/// Returned bytes are owned by `gpa`.
+fn buildSecretsJson(
+    gpa: std.mem.Allocator,
+    vars: []const project.Var,
+    pooled_url: []const u8,
+    direct_url: []const u8,
+) ![]u8 {
+    var json: std.Io.Writer.Allocating = .init(gpa);
+    defer json.deinit();
+    try json.writer.writeByte('{');
+    var first = true;
+    for (vars) |v| {
+        // The PR branch owns the DB URLs; ignore any DB entries in the base file.
+        if (std.mem.eql(u8, v.key, "DATABASE_URL") or std.mem.eql(u8, v.key, "DATABASE_URL_DIRECT")) continue;
+        try writePair(&json.writer, &first, v.key, v.value);
+    }
+    try writePair(&json.writer, &first, "DATABASE_URL", pooled_url);
+    try writePair(&json.writer, &first, "DATABASE_URL_DIRECT", direct_url);
+    try json.writer.writeByte('}');
+    return gpa.dupe(u8, json.written());
 }
 
 fn wrangler(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, sub: []const []const u8, dry_run: bool) !void {
@@ -207,15 +221,23 @@ fn readWorkerName(gpa: std.mem.Allocator, io: std.Io, proj: std.Io.Dir) ![]u8 {
         return error.NoProject;
     };
     defer gpa.free(bytes);
-    // Find the first `"name"` key and read its string value — robust to JSONC comments.
-    const key = std.mem.indexOf(u8, bytes, "\"name\"") orelse {
+    const name = parseWorkerName(bytes) orelse {
         say("akm preview: no \"name\" in wrangler.jsonc\n");
         return error.NoProject;
     };
-    const colon = std.mem.indexOfScalarPos(u8, bytes, key, ':') orelse return error.NoProject;
-    const q1 = std.mem.indexOfScalarPos(u8, bytes, colon, '"') orelse return error.NoProject;
-    const q2 = std.mem.indexOfScalarPos(u8, bytes, q1 + 1, '"') orelse return error.NoProject;
-    return gpa.dupe(u8, bytes[q1 + 1 .. q2]);
+    return gpa.dupe(u8, name);
+}
+
+/// Parse the first `"name"` string value from wrangler.jsonc bytes. Returns a
+/// slice into `bytes` (no allocation), or null if absent/malformed. The first
+/// `"name"` is the top-level Worker name (it precedes the container's name in
+/// the template) — robust to JSONC `//` comments since it scans raw text.
+fn parseWorkerName(bytes: []const u8) ?[]const u8 {
+    const key = std.mem.indexOf(u8, bytes, "\"name\"") orelse return null;
+    const colon = std.mem.indexOfScalarPos(u8, bytes, key, ':') orelse return null;
+    const q1 = std.mem.indexOfScalarPos(u8, bytes, colon, '"') orelse return null;
+    const q2 = std.mem.indexOfScalarPos(u8, bytes, q1 + 1, '"') orelse return null;
+    return bytes[q1 + 1 .. q2];
 }
 
 fn writePair(w: *std.Io.Writer, first: *bool, key: []const u8, value: []const u8) !void {
@@ -313,6 +335,68 @@ test "parseArgs requires action + pr" {
     const d = try parseArgs(&.{ "destroy", "--pr", "9" });
     try testing.expectEqual(@as(@TypeOf(d.action), .destroy), d.action);
     try testing.expectError(error.UnknownFlag, parseArgs(&.{ "create", "--pr", "1", "--bogus" }));
+}
+
+test "parseWorkerName: plain, JSONC comments, name after other keys, container name ignored" {
+    try testing.expectEqualStrings("acme", parseWorkerName(
+        \\{ "name": "acme", "main": "src/worker/index.ts" }
+    ).?);
+    // tolerant of // comments and whitespace
+    try testing.expectEqualStrings("acme", parseWorkerName(
+        \\// wrangler config
+        \\{
+        \\  "compatibility_date": "2026-01-01",
+        \\  "name": "acme"
+        \\}
+    ).?);
+    // the *first* "name" is the top-level Worker name; the container's name
+    // block comes later in the template and must NOT be picked.
+    try testing.expectEqualStrings("acme", parseWorkerName(
+        \\{ "name": "acme", "containers": [{ "name": "acme-backend" }] }
+    ).?);
+    // absent / malformed
+    try testing.expect(parseWorkerName("{ \"main\": \"x\" }") == null);
+    try testing.expect(parseWorkerName("") == null);
+}
+
+test "buildSecretsJson: branch DB URLs override base file; JSON-escaped; valid" {
+    const gpa = testing.allocator;
+    const vars = [_]project.Var{
+        .{ .key = "AKM_INTERNAL_JWT_KEY", .value = "k3y" },
+        .{ .key = "DATABASE_URL", .value = "base-should-be-ignored" },
+        .{ .key = "DATABASE_URL_DIRECT", .value = "base-direct-ignored" },
+        .{ .key = "CF_ACCESS_AUD", .value = "a\"b\\c" },
+    };
+    const out = try buildSecretsJson(gpa, &vars, "postgresql://pooled", "postgresql://direct");
+    defer gpa.free(out);
+
+    // the base-file DB URLs are dropped; the branch's are used
+    try testing.expect(std.mem.indexOf(u8, out, "base-should-be-ignored") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "base-direct-ignored") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"DATABASE_URL\":\"postgresql://pooled\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"DATABASE_URL_DIRECT\":\"postgresql://direct\"") != null);
+    // non-DB base vars are carried through
+    try testing.expect(std.mem.indexOf(u8, out, "\"AKM_INTERNAL_JWT_KEY\":\"k3y\"") != null);
+    // quotes/backslashes in values are JSON-escaped
+    try testing.expect(std.mem.indexOf(u8, out, "a\\\"b\\\\c") != null);
+
+    // and the whole thing is valid JSON with exactly the expected keys
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("postgresql://pooled", obj.get("DATABASE_URL").?.string);
+    try testing.expectEqualStrings("postgresql://direct", obj.get("DATABASE_URL_DIRECT").?.string);
+    try testing.expectEqualStrings("k3y", obj.get("AKM_INTERNAL_JWT_KEY").?.string);
+    try testing.expectEqualStrings("a\"b\\c", obj.get("CF_ACCESS_AUD").?.string);
+}
+
+test "buildSecretsJson: empty base file still emits the branch DB URLs" {
+    const gpa = testing.allocator;
+    const out = try buildSecretsJson(gpa, &.{}, "p", "d");
+    defer gpa.free(out);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.object.count());
 }
 
 test {

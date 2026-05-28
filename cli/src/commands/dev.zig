@@ -109,6 +109,11 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         break :blk env.get("AKM_INTERNAL_JWT_KEY").?;
     };
 
+    // Mark this as a dev run so the backend may start without a database
+    // (`akm dev` without --neon-branch / a DATABASE_URL in .dev.vars). In
+    // production this marker is absent, so a missing DATABASE_URL fails fast.
+    try env.put("AKM_DEV", "1");
+
     // ── spawn the backend (uvicorn) and the UI (Vite) ─────────────────────
     var bp_buf: [8]u8 = undefined;
     var vp_buf: [8]u8 = undefined;
