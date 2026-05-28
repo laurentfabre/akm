@@ -46,6 +46,16 @@ Round-2 audit otherwise verified every round-1 fix present and correct. Tests: 5
 - **R3-6 (MINOR)** proxy head bounded by count, not bytes. ✅ aggregate 64KiB request-head cap.
 Round-3 auth verdict: SHIP, fully clean. Tests after fixes: 54 unit green.
 
+## Round 4 (re-audit) — auth SHIP/clean; remaining edge cases, all fixed
+- **R4-1 (MAJOR)** `eatValue` swallowed a flag-looking value: `preview create --pr --dry-run` (empty `$PR` in CI) set `pr="--dry-run"`, left `dry_run=false`, and did a REAL deploy. ✅ all 4 `eatValue` copies reject a value starting with `-`.
+- **R4-2 (MAJOR)** p0-deploy chmod only ran on the write path; a pre-existing 0644 `.prod.vars` stayed world-readable. ✅ `chmod 600` after the if/else (always).
+- **R4-3 (MAJOR)** `parseVars` accepted duplicate keys → migrate (first) vs `secret bulk` (last-wins) could target different DBs. ✅ reject duplicate keys.
+- **R4-4 (MAJOR/MINOR)** dev `--neon-branch` partial-create: an interrupt/parse-error after the remote branch was made left `branch=null` → no cleanup. ✅ best-effort delete-by-name in the create catch path.
+- **R4-5 (MINOR)** components fetch followed redirects + unbounded body (SSRF/OOM). ✅ pin `https://ui.shadcn.com/`, `redirect_behavior=.not_allowed`, 2MiB cap.
+- **R4-6 (MINOR)** proxy accepted non-chunked TE (e.g. `gzip`) → possible deadlock. ✅ reject any request TE that isn't `chunked`.
+- **R4-7 (MINOR)** test scripts spliced `$APP`/`$WORK` into `bash -c`/`node -e`. ✅ pass paths via argv (`expect_fail_in`, `process.argv`, `bash -c '… "$1"' _ "$APP"`).
+Round-4 auth verdict: SHIP, clean. Tests after fixes: 55 unit green.
+
 ## MINOR (FIX cheap ones)
 - **N1 `.dev.vars` NUL → panic** (project.zig parseVars) — invalid key/value bytes panic `Environ.Map.put`. Validate keys, reject NUL, error with line number.
 - **N2 Dockerfile runs as root** — add a non-root `USER` before `CMD`.

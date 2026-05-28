@@ -207,6 +207,10 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
     // smuggling vector — reject rather than guess which framing wins (not just
     // `chunked` + CL: e.g. `Transfer-Encoding: gzip` + CL must fail too).
     if (has_te and content_length != null) return error.BadRequest;
+    // `chunked` is the only request transfer-coding the proxy frames. A TE the
+    // proxy doesn't understand (e.g. `gzip`, or chunked-not-final) would be
+    // forwarded with no body and can deadlock a close-delimited upstream — reject.
+    if (has_te and !chunked) return error.BadRequest;
 
     return .{
         .request_line = request_line,

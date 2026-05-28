@@ -50,8 +50,11 @@ step() { local n="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$n"; else bad "$
 printf "%b== setup ==%b\n" "$c_g" "$c_0"
 [ -x "$BIN" ] || (cd "$ROOT/cli" && zig build) || { echo "build failed"; exit 1; }
 step "init" "$BIN" init app "$APP"
-step "uv sync" bash -c "cd '$APP' && uv sync"
-step "npm install" bash -c "cd '$APP' && npm install"
+# $1 is expanded by the inner `bash -c`, not here — single quotes are intentional.
+# shellcheck disable=SC2016
+step "uv sync" bash -c 'cd "$1" && uv sync' _ "$APP"
+# shellcheck disable=SC2016
+step "npm install" bash -c 'cd "$1" && npm install' _ "$APP"
 
 printf "%b== start akm dev (ports %s/%s/%s) ==%b\n" "$c_g" "$PPORT" "$BPORT" "$VPORT" "$c_0"
 ( cd "$APP" && exec "$BIN" dev --port "$PPORT" --backend-port "$BPORT" --vite-port "$VPORT" ) \

@@ -112,6 +112,11 @@ pub fn parseVars(gpa: std.mem.Allocator, bytes: []const u8) ![]Var {
         if (std.mem.indexOfScalar(u8, key, 0) != null or std.mem.indexOfScalar(u8, value, 0) != null) {
             return error.InvalidVarByte;
         }
+        // Reject duplicate keys: consumers differ on which wins (deploy's migrate
+        // takes the first DATABASE_URL_DIRECT, but `wrangler secret bulk` gets the
+        // whole JSON and is commonly last-wins) — that could migrate one database
+        // and deploy the Worker pointed at another.
+        for (list.items) |existing| if (std.mem.eql(u8, existing.key, key)) return error.DuplicateVar;
         try list.append(gpa, .{ .key = key, .value = value });
     }
     return list.toOwnedSlice(gpa);
@@ -155,6 +160,11 @@ test "parseVars rejects NUL bytes (would panic Environ.Map.put)" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.InvalidVarByte, parseVars(gpa, "BAD\x00KEY=value\n"));
     try std.testing.expectError(error.InvalidVarByte, parseVars(gpa, "KEY=va\x00lue\n"));
+}
+
+test "parseVars rejects duplicate keys" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.DuplicateVar, parseVars(gpa, "DATABASE_URL=a\nDATABASE_URL=b\n"));
 }
 
 test "parseVars: comments, quotes, whitespace" {

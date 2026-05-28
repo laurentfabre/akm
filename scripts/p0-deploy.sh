@@ -115,11 +115,12 @@ DATABASE_URL_DIRECT="$DIRECT"
 CF_ACCESS_TEAM_DOMAIN="${CF_ACCESS_TEAM_DOMAIN:-CHANGEME-your-team}"
 CF_ACCESS_AUD="${CF_ACCESS_AUD:-CHANGEME-access-app-aud-tag}"
 EOF
-  # `umask` only affects NEW files; on a FORCE_PRODVARS rewrite of an existing
-  # file, `cat >` keeps its old (possibly 0644) mode — so set it explicitly.
-  chmod 600 .prod.vars
-  ok "wrote .prod.vars (mode 600)"
+  ok "wrote .prod.vars"
 fi
+# Always tighten the mode — `umask` only covers newly-created files, so a
+# pre-existing .prod.vars (left untouched above, or from an older run) could
+# otherwise stay world-readable with secrets in it.
+chmod 600 .prod.vars
 if grep -q CHANGEME .prod.vars 2>/dev/null; then
   warn "CF_ACCESS_* are placeholders — create the Cloudflare Access app/policy and fill them,"
   warn "  else the Worker rejects every /api/* request with 403 (goal.md §4.5)."

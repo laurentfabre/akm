@@ -246,20 +246,38 @@ fn isUnsafeRel(p: []const u8) bool {
     return false;
 }
 
+/// Max registry-response size — component JSON is small; cap it so a hostile
+/// or buggy server can't OOM the CLI by streaming an unbounded body.
+const max_registry_bytes = 2 * 1024 * 1024;
+
 fn httpGetJson(gpa: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
+    // Pin the registry origin: we only ever fetch from the shadcn registry over
+    // HTTPS. This (plus disabling redirects below) blocks SSRF where a crafted
+    // value redirects the fetch to localhost/internal endpoints.
+    if (!std.mem.startsWith(u8, url, "https://ui.shadcn.com/")) {
+        say2("akm components: refusing non-registry URL ", url);
+        say("\n");
+        return error.UntrustedUrl;
+    }
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
     var body: std.Io.Writer.Allocating = .init(gpa);
     errdefer body.deinit();
-    const res = try client.fetch(.{
+    const res = client.fetch(.{
         .location = .{ .url = url },
         .response_writer = &body.writer,
-    });
+        .redirect_behavior = .not_allowed, // no redirect-based SSRF
+    }) catch |err| {
+        say2("akm components: registry fetch failed: ", @errorName(err));
+        say("\n");
+        return err;
+    };
     if (res.status != .ok) {
         say2("akm components: registry returned ", @tagName(res.status));
         say("\n");
         return error.HttpStatus;
     }
+    if (body.written().len > max_registry_bytes) return error.RegistryResponseTooLarge;
     return body.toOwnedSlice();
 }
 

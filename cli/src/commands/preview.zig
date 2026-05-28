@@ -306,7 +306,10 @@ fn parseArgs(args: []const []const u8) !Options {
 
 fn eatValue(args: []const []const u8, i: *usize, arg: []const u8, flag: []const u8) ?[]const u8 {
     if (!std.mem.eql(u8, arg, flag)) return null;
-    if (i.* + 1 >= args.len) return null;
+    // A value that looks like a flag means the real value was omitted (e.g.
+    // `--pr --dry-run` when $PR is empty) — don't swallow the next flag as the
+    // value, which here would silently flip a dry-run into a real deploy.
+    if (i.* + 1 >= args.len or std.mem.startsWith(u8, args[i.* + 1], "-")) return null;
     i.* += 1;
     return args[i.*];
 }

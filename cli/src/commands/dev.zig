@@ -96,6 +96,10 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         branch = neon.create(gpa, io, neon_pid.?, name) catch |err| {
             say2("akm dev: Neon branch failed: ", @errorName(err));
             say(" (check neonctl auth / --neon-project)\n");
+            // create() may have made the remote branch before failing (e.g. a
+            // Ctrl-C mid-call, or a JSON-parse error after creation) — best-effort
+            // delete by name so we don't leave an orphan.
+            neon.delete(gpa, io, neon_pid.?, name);
             return err;
         };
         try env.put("DATABASE_URL", branch.?.pooled_url);
@@ -349,7 +353,9 @@ fn parseArgs(args: []const []const u8) !Options {
 /// If `arg == flag`, consume and return the next arg as its value.
 fn eatValue(args: []const []const u8, i: *usize, arg: []const u8, flag: []const u8) ?[]const u8 {
     if (!std.mem.eql(u8, arg, flag)) return null;
-    if (i.* + 1 >= args.len) return null;
+    // A value that looks like a flag means the real value was omitted — don't
+    // swallow the next flag as the value (e.g. `--neon-project --neon-branch`).
+    if (i.* + 1 >= args.len or std.mem.startsWith(u8, args[i.* + 1], "-")) return null;
     i.* += 1;
     return args[i.*];
 }
