@@ -83,6 +83,16 @@ pub fn baseChildEnv(gpa: std.mem.Allocator) !Environ.Map {
     return env;
 }
 
+test "parseVars is OOM-safe (no leak on allocation failure)" {
+    const Fn = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const vars = try parseVars(a, "A=1\nB=\"two\"\n# c\nLONG=value-here-0123456789\n");
+            a.free(vars); // entries borrow from the input; only the slice is owned
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fn.run, .{});
+}
+
 test "parseVars: comments, quotes, whitespace" {
     const gpa = std.testing.allocator;
     const vars = try parseVars(gpa,

@@ -55,28 +55,34 @@ pub const Minter = struct {
 
         const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
 
-        // Build the JSON payload. sub/email are JSON-string-escaped defensively.
-        var payload: std.Io.Writer.Allocating = .init(gpa);
-        defer payload.deinit();
-        const w = &payload.writer;
-        try w.print(
+        // Build the JSON payload into a plain ArrayList so allocation failure
+        // surfaces as `error.OutOfMemory` (a `Writer.Allocating` would mask it as
+        // `error.WriteFailed`). sub/email are JSON-string-escaped defensively.
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(gpa);
+        const prefix = try std.fmt.allocPrint(
+            gpa,
             "{{\"iss\":\"{s}\",\"aud\":\"{s}\",\"iat\":{d},\"nbf\":{d},\"exp\":{d},\"sub\":",
             .{ ISS, AUD, now, now, now + TTL_SECONDS },
         );
-        try writeJsonString(w, sub);
-        try w.print(",\"kind\":\"{s}\"", .{kind.str()});
+        defer gpa.free(prefix);
+        try payload.appendSlice(gpa, prefix);
+        try appendJsonString(gpa, &payload, sub);
+        const kind_part = try std.fmt.allocPrint(gpa, ",\"kind\":\"{s}\"", .{kind.str()});
+        defer gpa.free(kind_part);
+        try payload.appendSlice(gpa, kind_part);
         if (email) |e| {
-            try w.writeAll(",\"email\":");
-            try writeJsonString(w, e);
+            try payload.appendSlice(gpa, ",\"email\":");
+            try appendJsonString(gpa, &payload, e);
         }
-        try w.writeByte('}');
+        try payload.append(gpa, '}');
 
         // Assemble b64(header).b64(payload), HMAC it, append b64(sig).
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
         try appendB64(gpa, &out, header);
         try out.append(gpa, '.');
-        try appendB64(gpa, &out, payload.written());
+        try appendB64(gpa, &out, payload.items);
 
         var mac: [HmacSha256.mac_length]u8 = undefined;
         HmacSha256.create(&mac, out.items, self.key);
@@ -94,18 +100,22 @@ fn appendB64(gpa: std.mem.Allocator, out: *std.ArrayList(u8), src: []const u8) !
     _ = b64.encode(out.items[start..], src);
 }
 
-/// Minimal RFC 8259 string escaping — enough for the sub/email values akm mints.
-fn writeJsonString(w: anytype, s: []const u8) !void {
-    try w.writeByte('"');
+/// Append a JSON-escaped string (minimal RFC 8259) to `out` — enough for the
+/// sub/email values akm mints. Allocation failure propagates as OutOfMemory.
+fn appendJsonString(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    try out.append(gpa, '"');
     for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        else => if (c < 0x20) try w.print("\\u{x:0>4}", .{c}) else try w.writeByte(c),
+        '"' => try out.appendSlice(gpa, "\\\""),
+        '\\' => try out.appendSlice(gpa, "\\\\"),
+        '\n' => try out.appendSlice(gpa, "\\n"),
+        '\r' => try out.appendSlice(gpa, "\\r"),
+        '\t' => try out.appendSlice(gpa, "\\t"),
+        else => if (c < 0x20) {
+            var buf: [6]u8 = undefined;
+            try out.appendSlice(gpa, std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable);
+        } else try out.append(gpa, c),
     };
-    try w.writeByte('"');
+    try out.append(gpa, '"');
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -161,6 +171,17 @@ test "user payload carries email and required claims" {
     try testing.expectEqualStrings("dev@akm.local", obj.get("email").?.string);
     try testing.expectEqual(@as(i64, 1000), obj.get("iat").?.integer);
     try testing.expectEqual(@as(i64, 1120), obj.get("exp").?.integer);
+}
+
+test "mint is OOM-safe (no leak on allocation failure)" {
+    const Fn = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const m = Minter{ .key = "test-key-0123456789ab" };
+            const tok = try m.mint(a, "dev@akm.local", .user, "dev@akm.local", 1000);
+            a.free(tok);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Fn.run, .{});
 }
 
 test "service token omits email" {

@@ -156,8 +156,10 @@ pub fn ensure(gpa: std.mem.Allocator, io: std.Io, project_id: []const u8, name: 
 /// Parse `neonctl branches create --output json`, building owned pooled/direct
 /// URLs. Split out from `create` so it can be unit-tested without the CLI.
 fn parseCreate(gpa: std.mem.Allocator, json_bytes: []const u8) Error!Branch {
-    var parsed = std.json.parseFromSlice(std.json.Value, gpa, json_bytes, .{}) catch
-        return Error.NeonOutputUnexpected;
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, json_bytes, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory, // don't masquerade OOM as a parse error
+        else => return Error.NeonOutputUnexpected,
+    };
     defer parsed.deinit();
 
     const root = obj(parsed.value) orelse return Error.NeonOutputUnexpected;
@@ -261,6 +263,21 @@ test "parseCreate extracts id and builds pooled/direct psycopg URLs" {
         "postgresql+psycopg://alex:pw@ep-cool-123-pooler.us-east-2.aws.neon.tech/db?sslmode=require",
         br.pooled_url,
     );
+}
+
+test "parseCreate is OOM-safe (no leak; returns OutOfMemory, not a parse error)" {
+    const sample =
+        \\{ "branch": { "id": "br-x" },
+        \\  "connection_uris": [ { "connection_uri": "postgresql://u:p@h.neon.tech/db?sslmode=require",
+        \\    "connection_parameters": { "host": "h.neon.tech", "pooler_host": "h-pooler.neon.tech" } } ] }
+    ;
+    const Fn = struct {
+        fn run(a: std.mem.Allocator, json: []const u8) !void {
+            var br = try parseCreate(a, json);
+            br.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fn.run, .{sample});
 }
 
 test "parseCreate rejects malformed output" {
