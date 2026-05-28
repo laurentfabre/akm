@@ -133,8 +133,11 @@ fn runAdd(gpa: std.mem.Allocator, args: []const []const u8) !void {
     try spawnNpm(io, dir, argv.items, false);
 }
 
-/// Spawn npm with inherited stdio in `dir`. `interruptible` = a Ctrl-C exit is
-/// expected (long-running `dev`), so don't flag a nonzero/signal termination.
+/// Spawn npm with inherited stdio in `dir`. `interruptible` = a long-running
+/// server (`dev`) the user stops with Ctrl-C: a *signal* termination, or npm's
+/// 130/143 (128+SIGINT/SIGTERM) exit, is then the normal stop — but a plain
+/// nonzero exit (e.g. no `dev` script, Vite crashed at startup) is still a real
+/// failure, so we don't blanket-ignore it the way a bare early return would.
 fn spawnNpm(io: std.Io, dir: []const u8, argv: []const []const u8, interruptible: bool) !void {
     var child = std.process.spawn(io, .{
         .argv = argv,
@@ -148,8 +151,11 @@ fn spawnNpm(io: std.Io, dir: []const u8, argv: []const []const u8, interruptible
         return err;
     };
     const term = try child.wait(io);
-    if (interruptible) return; // stopping `dev` is the normal exit path
-    if (term != .exited or term.exited != 0) {
+    const ok = switch (term) {
+        .exited => |code| code == 0 or (interruptible and (code == 130 or code == 143)),
+        else => interruptible, // killed by a signal: normal only when stopping `dev`
+    };
+    if (!ok) {
         say("akm frontend: command failed (have you run `akm frontend install`?).\n");
         return error.FrontendFailed;
     }
