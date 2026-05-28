@@ -1,3 +1,31 @@
+# akm — Adversarial Codex 5.5 audit — CONVERGED (round 10)
+
+**Status: converged.** 10 adversarial rounds (gpt-5.5, xhigh, 3 parallel
+component audits each). Zero BLOCKER for 8 straight rounds; auth trust boundary
+SHIP/clean for 7 straight rounds; the last real MAJOR (Vite secret isolation in
+`akm dev`) fixed with a default-deny allowlist. 10 fix commits, each verified
+green (final: 58 unit / 52 e2e / 10 dev-smoke; live Neon preview verified).
+
+Round-10's only new angle ("broader Vite env paths") was verified by code
+inspection to be a non-issue: `akm frontend`/`akm build` spawn npm/Vite with the
+plain inherited shell env and inject NO akm secrets — identical to running npm
+directly. akm injects DB/JWT secrets into a Vite-adjacent env only in `akm dev`
+(isolated via `project.frontendEnv`); deploy/preview pass secrets via stdin.
+
+Remaining (deliberately deferred, documented, low real risk):
+- proxy per-connection read deadline — dev-only localhost, bounded by the
+  256-connection cap; a real deadline needs nontrivial Io timer plumbing.
+- neonctl unbounded stdout/timeout — trusted local CLI, KB-sized output.
+
+Findings found+fixed across rounds: 1 BLOCKER class (`--dry-run` mutating Neon),
+~20 MAJOR (auth NaN-bypass + lifetime bound, CL/CL & TE/CL & non-chunked-TE
+smuggling, failed-WS-upgrade tunnel, neon URL corruption, eatValue flag-swallow,
+package-name & p0-deploy injection, registry-source RCE + postinstall, JSONC
+worker-name confusion, dev secret→Vite leak, dup .dev.vars keys, neon-name
+collision, --secrets cwd, dev signal/orphan races), and a dozen MINORs.
+
+---
+
 # akm — Adversarial Codex 5.5 audit (round 1)
 
 Three parallel `codex exec` audits (gpt-5.5, xhigh reasoning, read-only sandbox):
