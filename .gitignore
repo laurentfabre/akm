@@ -1,3 +1,6 @@
 # build artifacts
 cli/zig-out/
 cli/.zig-cache/
+
+# macOS
+.DS_Store
