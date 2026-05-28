@@ -46,8 +46,12 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var vars: []project.Var = &.{};
     defer if (vars.len > 0) gpa.free(vars);
     if (opts.secrets_file) |sf| {
-        secrets_bytes = std.Io.Dir.cwd().readFileAlloc(io, sf, gpa, .limited(1 << 20)) catch {
-            say2("akm deploy: cannot read secrets file '", sf);
+        // Resolve --secrets against the PROJECT dir, not the caller's cwd, so
+        // `akm deploy apps/foo --secrets .prod.vars` reads apps/foo/.prod.vars
+        // (matching where everything else for this project runs). Absolute
+        // paths still work (openat ignores the base dir for them).
+        secrets_bytes = proj.readFileAlloc(io, sf, gpa, .limited(1 << 20)) catch {
+            say2("akm deploy: cannot read secrets file (relative to the project dir) '", sf);
             say("'\n");
             return error.SecretsFile;
         };
@@ -224,7 +228,9 @@ fn parseArgs(args: []const []const u8) !Options {
 
 fn eatValue(args: []const []const u8, i: *usize, arg: []const u8, flag: []const u8) ?[]const u8 {
     if (!std.mem.eql(u8, arg, flag)) return null;
-    if (i.* + 1 >= args.len) return null;
+    // A value that looks like a flag means the real value was omitted — don't
+    // swallow the next flag as the value (e.g. `--secrets --migrate`).
+    if (i.* + 1 >= args.len or std.mem.startsWith(u8, args[i.* + 1], "-")) return null;
     i.* += 1;
     return args[i.*];
 }

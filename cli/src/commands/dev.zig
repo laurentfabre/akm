@@ -62,6 +62,13 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         else => return err,
     };
 
+    // Install signal handlers BEFORE any cloud mutation (Neon branch) or child
+    // spawn. The handler only sets `should_stop`; default disposition would kill
+    // the process without running the teardown defers below (orphaning the
+    // branch / children). After each mutation we re-check `should_stop` and
+    // return through the defers if interrupted.
+    installSignalHandlers();
+
     // ── optional ephemeral Neon branch ───────────────────────────────────
     var branch: ?neon.Branch = null;
     var neon_pid: ?[]u8 = null; // owned; kept alive for the teardown defer
@@ -76,19 +83,31 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         }
         if (neon_pid) |pid| gpa.free(pid);
     }
-    if (opts.neon_branch) {
+    if (opts.neon_branch and !should_stop.load(.acquire)) {
         const project_id = opts.neon_project orelse env.get("NEON_PROJECT_ID") orelse {
             say("akm dev: --neon-branch needs --neon-project ID (or NEON_PROJECT_ID).\n");
             return error.MissingNeonProject;
         };
         neon_pid = try gpa.dupe(u8, project_id);
+        // Collision-resistant name (timestamp + random): two `akm dev --neon-branch`
+        // started in the same second must NOT share a name — otherwise the loser's
+        // create fails on conflict and the by-name cleanup below would delete the
+        // winner's live branch. A unique name also means by-name delete on failure
+        // only ever targets our own branch.
+        const rnd_hex = std.fmt.bytesToHex(devRandomBytes(io)[0..6].*, .lower);
         var name_buf: [64]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "akm-dev-{d}", .{std.Io.Clock.now(.real, io).toSeconds()}) catch "akm-dev";
+        const name = std.fmt.bufPrint(&name_buf, "akm-dev-{d}-{s}", .{
+            std.Io.Clock.now(.real, io).toSeconds(), &rnd_hex,
+        }) catch "akm-dev";
         say2("akm dev: creating Neon branch ", name);
         say(" …\n");
         branch = neon.create(gpa, io, neon_pid.?, name) catch |err| {
             say2("akm dev: Neon branch failed: ", @errorName(err));
             say(" (check neonctl auth / --neon-project)\n");
+            // create() may have made the remote branch before failing (e.g. a
+            // Ctrl-C mid-call, or a JSON-parse error after creation) — best-effort
+            // delete by name so we don't leave an orphan.
+            neon.delete(gpa, io, neon_pid.?, name);
             return err;
         };
         try env.put("DATABASE_URL", branch.?.pooled_url);
@@ -97,6 +116,9 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         // have no revisions yet, which is not an error worth aborting for).
         migrate(gpa, io, opts.dir, &env);
     }
+    // Interrupted during branch creation/migration → return through the defer
+    // above, which deletes the branch (no orphan).
+    if (should_stop.load(.acquire)) return;
 
     // ── ensure a signing key shared by minter and backend ─────────────────
     const jwt_key = blk: {
@@ -108,6 +130,12 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         say("akm dev: generated an ephemeral AKM_INTERNAL_JWT_KEY for this session.\n");
         break :blk env.get("AKM_INTERNAL_JWT_KEY").?;
     };
+    // The proxy runs detached handler threads that may briefly outlive this
+    // function (bounded drain in proxy.run) and read cfg.minter.key. The slice
+    // above borrows from `env`, which `defer env.deinit()` frees on unwind — so
+    // copy the key into process-lifetime memory (page_allocator, never freed;
+    // reclaimed at exit) to rule out any use-after-free on shutdown.
+    const jwt_key_owned = try std.heap.page_allocator.dupe(u8, jwt_key);
 
     // Mark this as a dev run so the backend may start without a database
     // (`akm dev` without --neon-branch / a DATABASE_URL in .dev.vars). In
@@ -129,12 +157,21 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     };
     const vite_argv = [_][]const u8{ "npm", "run", "dev", "--", "--port", vp, "--strictPort" };
 
+    // Vite gets a SEPARATE, allowlist-built env (project.frontendEnv): only the
+    // backend needs the DB URLs and AKM_INTERNAL_JWT_KEY. A compromised Vite
+    // plugin/dev-dependency runs with this env, so it must see neither the secrets
+    // akm injects NOR secrets the developer exported in their shell/CI/direnv
+    // (default-deny — baseChildEnv would clone the whole parent env).
+    var vite_env = try project.frontendEnv(gpa);
+    defer vite_env.deinit();
+
+    // (Signal handlers were installed above, before the Neon branch / spawn.)
     var backend = spawnChild(io, opts.dir, &env, &backend_argv) catch |err| {
         say2("akm dev: failed to start uvicorn (is `uv` installed?): ", @errorName(err));
         say("\n");
         return err;
     };
-    var vite = spawnChild(io, opts.dir, &env, &vite_argv) catch |err| {
+    var vite = spawnChild(io, opts.dir, &vite_env, &vite_argv) catch |err| {
         say2("akm dev: failed to start Vite (is `npm` installed + `npm install` run?): ", @errorName(err));
         say("\n");
         killChild(io, &backend);
@@ -142,8 +179,8 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer shutdownChildren(io, &backend, &vite);
 
-    // ── signals + watcher, then run the proxy (blocks) ────────────────────
-    installSignalHandlers();
+    // ── watcher, then run the proxy (blocks) ──────────────────────────────
+    // (signal handlers were installed before the children spawned, above)
     const watch = try std.Thread.spawn(.{}, watcher, .{ io, opts.proxy_port });
 
     printBanner(opts, pkg);
@@ -151,7 +188,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         .proxy_port = opts.proxy_port,
         .backend_port = opts.backend_port,
         .vite_port = opts.vite_port,
-        .minter = .{ .key = jwt_key },
+        .minter = .{ .key = jwt_key_owned },
         .dev_user = opts.dev_user,
     };
     proxy.run(io, cfg, &should_stop) catch |err| {
@@ -332,7 +369,9 @@ fn parseArgs(args: []const []const u8) !Options {
 /// If `arg == flag`, consume and return the next arg as its value.
 fn eatValue(args: []const []const u8, i: *usize, arg: []const u8, flag: []const u8) ?[]const u8 {
     if (!std.mem.eql(u8, arg, flag)) return null;
-    if (i.* + 1 >= args.len) return null;
+    // A value that looks like a flag means the real value was omitted — don't
+    // swallow the next flag as the value (e.g. `--neon-project --neon-branch`).
+    if (i.* + 1 >= args.len or std.mem.startsWith(u8, args[i.* + 1], "-")) return null;
     i.* += 1;
     return args[i.*];
 }

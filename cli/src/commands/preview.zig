@@ -49,15 +49,22 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     const branch = try std.fmt.allocPrint(gpa, "akm-pr-{s}", .{opts.pr});
     defer gpa.free(branch);
 
-    const neon_project = opts.neon_project orelse main.environ_map.get("NEON_PROJECT_ID") orelse {
-        say("akm preview: needs --neon-project ID (or NEON_PROJECT_ID).\n");
-        return error.MissingNeonProject;
-    };
+    // Resolve lazily — a `--dry-run` create/destroy never touches Neon, so it
+    // must not require a project id. Each cloud path requires it where used.
+    const neon_project = opts.neon_project orelse main.environ_map.get("NEON_PROJECT_ID");
 
     switch (opts.action) {
         .create => try create(gpa, io, proj, opts, worker, branch, neon_project),
         .destroy => try destroy(gpa, io, opts, worker, branch, neon_project),
     }
+}
+
+/// Require a Neon project id (only the real, cloud-touching paths need one).
+fn requireNeonProject(neon_project: ?[]const u8) ![]const u8 {
+    return neon_project orelse {
+        say("akm preview: needs --neon-project ID (or NEON_PROJECT_ID).\n");
+        return error.MissingNeonProject;
+    };
 }
 
 fn create(
@@ -67,30 +74,35 @@ fn create(
     opts: Options,
     worker: []const u8,
     branch: []const u8,
-    neon_project: []const u8,
+    neon_project: ?[]const u8,
 ) !void {
     say2("akm preview: creating preview for PR #", opts.pr);
     say("\n");
 
-    // 1. Per-PR Neon branch (real, idempotent).
-    say2("akm preview: ensuring Neon branch ", branch);
-    say(" …\n");
-    var br = try neon.ensure(gpa, io, neon_project, branch);
-    defer br.deinit();
-
-    // 2. Build artifacts.
+    // 1. Build artifacts — local only, no cloud mutation; also gives the
+    //    wrangler bundle/assets that `deploy --dry-run` validates.
     const pkg = try project.discoverPkg(gpa, io, proj);
     defer gpa.free(pkg);
     if (!opts.skip_build) try build.buildArtifacts(gpa, io, proj, opts.dir, pkg, false);
 
-    // 3. Secrets = base file (AKM key + CF_ACCESS) + the PR branch's DB URLs.
+    // 2. Cloud mutations (Neon branch + secret upload) happen ONLY for a real
+    //    run. `--dry-run` must not create a branch or push secrets — it only
+    //    validates the wrangler deploy below. (Was a BLOCKER: dry-run created
+    //    the branch via neon.ensure before this check.)
     if (opts.dry_run) {
-        say("akm preview: --dry-run, skipping secret upload\n");
+        say2("akm preview: --dry-run — would ensure Neon branch ", branch);
+        say(" and upload secrets (skipped)\n");
     } else {
-        try pushSecrets(gpa, io, opts, worker, br);
+        const np = try requireNeonProject(neon_project);
+        say2("akm preview: ensuring Neon branch ", branch);
+        say(" …\n");
+        var br = try neon.ensure(gpa, io, np, branch);
+        defer br.deinit();
+        // Secrets = base file (AKM key + CF_ACCESS) + this PR branch's DB URLs.
+        try pushSecrets(gpa, io, proj, opts, worker, br);
     }
 
-    // 4. Deploy the named per-PR Worker.
+    // 3. Deploy the named per-PR Worker (validated, not shipped, under --dry-run).
     try wrangler(gpa, io, opts.dir, &.{ "deploy", "--name", worker }, opts.dry_run);
 
     say2("\nakm preview: PR #", opts.pr);
@@ -98,7 +110,7 @@ fn create(
     say2(", Neon branch ", branch);
     say("\n");
     if (opts.dry_run) {
-        say("akm preview: dry-run OK (Neon branch made; wrangler deploy validated, not shipped).\n");
+        say("akm preview: dry-run OK (no cloud changes; wrangler deploy validated, not shipped).\n");
     } else {
         say2("akm preview: live at https://", worker);
         say(".<your-subdomain>.workers.dev (behind Cloudflare Access)\n");
@@ -111,33 +123,39 @@ fn destroy(
     opts: Options,
     worker: []const u8,
     branch: []const u8,
-    neon_project: []const u8,
+    neon_project: ?[]const u8,
 ) !void {
     say2("akm preview: destroying preview for PR #", opts.pr);
     say("\n");
     if (opts.dry_run) {
-        say2("akm preview: --dry-run, would `wrangler delete --name ", worker);
-        say("`\n");
-    } else {
-        // Best-effort: tear down the Worker, then the branch, regardless of order outcome.
-        wrangler(gpa, io, opts.dir, &.{ "delete", "--name", worker }, false) catch
-            say("akm preview: wrangler delete failed (already gone?) — continuing\n");
+        // Dry-run must not delete anything (was a BLOCKER: neon.delete ran
+        // unconditionally, so `destroy --dry-run` deleted the real branch).
+        say2("akm preview: --dry-run — would `wrangler delete --name ", worker);
+        say2("` and delete Neon branch ", branch);
+        say(" (no changes made)\n");
+        return;
     }
+    const np = try requireNeonProject(neon_project);
+    // Best-effort: tear down the Worker, then the branch, regardless of order outcome.
+    wrangler(gpa, io, opts.dir, &.{ "delete", "--name", worker }, false) catch
+        say("akm preview: wrangler delete failed (already gone?) — continuing\n");
     say2("akm preview: deleting Neon branch ", branch);
     say(" …\n");
-    neon.delete(gpa, io, neon_project, branch);
+    neon.delete(gpa, io, np, branch);
     say("akm preview: done.\n");
 }
 
 /// Upload base secrets + the PR branch DB URLs via `wrangler secret bulk --name`.
-fn pushSecrets(gpa: std.mem.Allocator, io: std.Io, opts: Options, worker: []const u8, br: neon.Branch) !void {
+fn pushSecrets(gpa: std.mem.Allocator, io: std.Io, proj: std.Io.Dir, opts: Options, worker: []const u8, br: neon.Branch) !void {
     var bytes: ?[]u8 = null;
     defer if (bytes) |b| gpa.free(b);
     var vars: []project.Var = &.{};
     defer if (vars.len > 0) gpa.free(vars);
     if (opts.secrets_file) |sf| {
-        bytes = std.Io.Dir.cwd().readFileAlloc(io, sf, gpa, .limited(1 << 20)) catch {
-            say2("akm preview: cannot read secrets file '", sf);
+        // Resolve --secrets against the PROJECT dir, not the caller's cwd (see
+        // the same fix in deploy.zig). Absolute paths still work.
+        bytes = proj.readFileAlloc(io, sf, gpa, .limited(1 << 20)) catch {
+            say2("akm preview: cannot read secrets file (relative to the project dir) '", sf);
             say("'\n");
             return error.SecretsFile;
         };
@@ -221,23 +239,120 @@ fn readWorkerName(gpa: std.mem.Allocator, io: std.Io, proj: std.Io.Dir) ![]u8 {
         return error.NoProject;
     };
     defer gpa.free(bytes);
-    const name = parseWorkerName(bytes) orelse {
+    // Strip JSONC comments FIRST so a `// "name": "other"` comment (or a `"name"`
+    // inside a `/* */` block) can't be mistaken for the real top-level key — that
+    // could make preview target/delete the wrong Worker.
+    const clean = try stripJsoncComments(gpa, bytes);
+    defer gpa.free(clean);
+    const name = parseWorkerName(clean) orelse {
         say("akm preview: no \"name\" in wrangler.jsonc\n");
         return error.NoProject;
     };
     return gpa.dupe(u8, name);
 }
 
-/// Parse the first `"name"` string value from wrangler.jsonc bytes. Returns a
-/// slice into `bytes` (no allocation), or null if absent/malformed. The first
-/// `"name"` is the top-level Worker name (it precedes the container's name in
-/// the template) — robust to JSONC `//` comments since it scans raw text.
+/// Blank out JSONC comments (`//…` line and `/* … */` block) while preserving
+/// string contents, so a `//` inside a string value (e.g. `"https://…"`) is not
+/// treated as a comment. Returns an owned copy the same length as `src`.
+fn stripJsoncComments(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
+    const out = try gpa.dupe(u8, src);
+    var i: usize = 0;
+    var in_str = false;
+    while (i < out.len) {
+        const c = out[i];
+        if (in_str) {
+            if (c == '\\' and i + 1 < out.len) {
+                i += 2; // skip an escaped char (e.g. \")
+                continue;
+            }
+            if (c == '"') in_str = false;
+            i += 1;
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+            i += 1;
+        } else if (c == '/' and i + 1 < out.len and out[i + 1] == '/') {
+            while (i < out.len and out[i] != '\n') : (i += 1) out[i] = ' ';
+        } else if (c == '/' and i + 1 < out.len and out[i + 1] == '*') {
+            out[i] = ' ';
+            out[i + 1] = ' ';
+            i += 2;
+            while (i < out.len) : (i += 1) {
+                if (out[i] == '*' and i + 1 < out.len and out[i + 1] == '/') {
+                    out[i] = ' ';
+                    out[i + 1] = ' ';
+                    i += 2;
+                    break;
+                }
+                out[i] = ' ';
+            }
+        } else {
+            i += 1;
+        }
+    }
+    return out;
+}
+
+/// Find the TOP-LEVEL (depth-1) `"name"` string value in comment-free JSON(C)
+/// bytes. Depth-aware so a nested `"vars": {"name": …}` or `containers[].name`
+/// (both present in the template, possibly before the top-level key) can't be
+/// mistaken for the Worker name. Returns a slice into `bytes`, or null.
 fn parseWorkerName(bytes: []const u8) ?[]const u8 {
-    const key = std.mem.indexOf(u8, bytes, "\"name\"") orelse return null;
-    const colon = std.mem.indexOfScalarPos(u8, bytes, key, ':') orelse return null;
-    const q1 = std.mem.indexOfScalarPos(u8, bytes, colon, '"') orelse return null;
-    const q2 = std.mem.indexOfScalarPos(u8, bytes, q1 + 1, '"') orelse return null;
-    return bytes[q1 + 1 .. q2];
+    var i: usize = 0;
+    var depth: usize = 0;
+    while (i < bytes.len) {
+        switch (bytes[i]) {
+            '{', '[' => {
+                depth += 1;
+                i += 1;
+            },
+            '}', ']' => {
+                if (depth > 0) depth -= 1;
+                i += 1;
+            },
+            '"' => {
+                const s = readJsonString(bytes, &i) orelse return null; // advances i past closing quote
+                if (depth == 1 and std.mem.eql(u8, s, "name")) {
+                    skipWs(bytes, &i);
+                    if (i < bytes.len and bytes[i] == ':') {
+                        i += 1;
+                        skipWs(bytes, &i);
+                        if (i < bytes.len and bytes[i] == '"') return readJsonString(bytes, &i);
+                    }
+                }
+            },
+            else => i += 1,
+        }
+    }
+    return null;
+}
+
+/// Parse a JSON string starting at the opening quote `bytes[i.*]=='"'`. Returns
+/// the raw inner slice and advances `i` past the closing quote; null if
+/// unterminated. (Escapes aren't decoded — fine for matching keys/slug values.)
+fn readJsonString(bytes: []const u8, i: *usize) ?[]const u8 {
+    const start = i.* + 1;
+    var j = start;
+    while (j < bytes.len) {
+        if (bytes[j] == '\\') {
+            j += 2;
+            continue;
+        }
+        if (bytes[j] == '"') {
+            i.* = j + 1;
+            return bytes[start..j];
+        }
+        j += 1;
+    }
+    return null;
+}
+
+fn skipWs(bytes: []const u8, i: *usize) void {
+    while (i.* < bytes.len) : (i.* += 1) switch (bytes[i.*]) {
+        ' ', '\t', '\n', '\r' => {},
+        else => return,
+    };
 }
 
 fn writePair(w: *std.Io.Writer, first: *bool, key: []const u8, value: []const u8) !void {
@@ -297,7 +412,10 @@ fn parseArgs(args: []const []const u8) !Options {
 
 fn eatValue(args: []const []const u8, i: *usize, arg: []const u8, flag: []const u8) ?[]const u8 {
     if (!std.mem.eql(u8, arg, flag)) return null;
-    if (i.* + 1 >= args.len) return null;
+    // A value that looks like a flag means the real value was omitted (e.g.
+    // `--pr --dry-run` when $PR is empty) — don't swallow the next flag as the
+    // value, which here would silently flip a dry-run into a real deploy.
+    if (i.* + 1 >= args.len or std.mem.startsWith(u8, args[i.* + 1], "-")) return null;
     i.* += 1;
     return args[i.*];
 }
@@ -337,26 +455,37 @@ test "parseArgs requires action + pr" {
     try testing.expectError(error.UnknownFlag, parseArgs(&.{ "create", "--pr", "1", "--bogus" }));
 }
 
-test "parseWorkerName: plain, JSONC comments, name after other keys, container name ignored" {
+test "parseWorkerName reads only the TOP-LEVEL name (ignores nested)" {
     try testing.expectEqualStrings("acme", parseWorkerName(
         \\{ "name": "acme", "main": "src/worker/index.ts" }
     ).?);
-    // tolerant of // comments and whitespace
+    // nested name(s) appearing BEFORE the top-level key must NOT be picked
     try testing.expectEqualStrings("acme", parseWorkerName(
-        \\// wrangler config
-        \\{
-        \\  "compatibility_date": "2026-01-01",
-        \\  "name": "acme"
-        \\}
+        \\{ "vars": { "name": "nested" }, "containers": [ { "name": "acme-backend" } ], "name": "acme" }
     ).?);
-    // the *first* "name" is the top-level Worker name; the container's name
-    // block comes later in the template and must NOT be picked.
+    // top-level name before a nested container name also works
     try testing.expectEqualStrings("acme", parseWorkerName(
         \\{ "name": "acme", "containers": [{ "name": "acme-backend" }] }
     ).?);
-    // absent / malformed
+    // no top-level name (only nested) → null
+    try testing.expect(parseWorkerName("{ \"vars\": { \"name\": \"x\" } }") == null);
     try testing.expect(parseWorkerName("{ \"main\": \"x\" }") == null);
     try testing.expect(parseWorkerName("") == null);
+}
+
+test "stripJsoncComments + parseWorkerName ignores name in comments / string values" {
+    const gpa = testing.allocator;
+    const src =
+        \\{
+        \\  // "name": "commented-out",
+        \\  "main": "https://example.com/x", // a // inside a string is NOT a comment
+        \\  /* "name": "block-commented" */
+        \\  "name": "real-app"
+        \\}
+    ;
+    const clean = try stripJsoncComments(gpa, src);
+    defer gpa.free(clean);
+    try testing.expectEqualStrings("real-app", parseWorkerName(clean).?);
 }
 
 test "buildSecretsJson: branch DB URLs override base file; JSON-escaped; valid" {

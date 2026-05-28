@@ -246,21 +246,42 @@ fn isUnsafeRel(p: []const u8) bool {
     return false;
 }
 
+/// Max registry-response size — component JSON is small; cap it so a hostile
+/// or buggy server can't OOM the CLI by streaming an unbounded body.
+const max_registry_bytes = 2 * 1024 * 1024;
+
 fn httpGetJson(gpa: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
+    // Pin the registry origin: we only ever fetch from the shadcn registry over
+    // HTTPS. This (plus disabling redirects below) blocks SSRF where a crafted
+    // value redirects the fetch to localhost/internal endpoints.
+    if (!std.mem.startsWith(u8, url, "https://ui.shadcn.com/")) {
+        say2("akm components: refusing non-registry URL ", url);
+        say("\n");
+        return error.UntrustedUrl;
+    }
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
-    var body: std.Io.Writer.Allocating = .init(gpa);
-    errdefer body.deinit();
-    const res = try client.fetch(.{
+    // Stream into a FIXED, pre-capped buffer: memory can't grow past the cap
+    // (a post-hoc length check would let an unbounded body OOM us first). A body
+    // that overflows the buffer surfaces as a write error from fetch.
+    const buf = try gpa.alloc(u8, max_registry_bytes);
+    defer gpa.free(buf);
+    var body = std.Io.Writer.fixed(buf);
+    const res = client.fetch(.{
         .location = .{ .url = url },
-        .response_writer = &body.writer,
-    });
+        .response_writer = &body,
+        .redirect_behavior = .not_allowed, // no redirect-based SSRF
+    }) catch |err| {
+        say2("akm components: registry fetch failed (or response > cap): ", @errorName(err));
+        say("\n");
+        return err;
+    };
     if (res.status != .ok) {
         say2("akm components: registry returned ", @tagName(res.status));
         say("\n");
         return error.HttpStatus;
     }
-    return body.toOwnedSlice();
+    return gpa.dupe(u8, body.buffered());
 }
 
 fn readStyle(gpa: std.mem.Allocator, io: std.Io, proj: std.Io.Dir) ![]u8 {
@@ -331,10 +352,43 @@ fn patch(
     say("\n");
 }
 
+/// A plausible npm *package* spec (registry source only): `(@scope/)?name`
+/// optionally with an `@version`/range. Rejects flags (leading `-`),
+/// whitespace/control bytes, AND non-registry sources — a `:` (so `https://…`,
+/// `git+ssh://…`, `git:`, `file:` are out) and any `/` that isn't the single
+/// `@scope/` separator (so local paths like `./x` are out). A compromised
+/// registry must not be able to make `npm install` run arbitrary code from a
+/// URL/git/file/path source via lifecycle scripts.
+fn isSafeDepSpec(p: []const u8) bool {
+    if (p.len == 0 or p[0] == '-') return false;
+    for (p) |c| if (c <= ' ' or c == 0x7f) return false;
+    if (std.mem.indexOfScalar(u8, p, ':') != null) return false; // URLs / git: / file:
+    if (std.mem.indexOfScalar(u8, p, '/')) |slash| {
+        if (p[0] != '@') return false; // only @scope/name may contain a slash
+        if (std.mem.indexOfScalarPos(u8, p, slash + 1, '/') != null) return false; // one slash max
+    }
+    return true;
+}
+
 fn npmInstall(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, pkgs: []const []const u8) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    try argv.appendSlice(gpa, &.{ "npm", "install" });
+    // `--ignore-scripts`: these package names come from the remote shadcn
+    // registry. Even restricted to registry sources, an attacker-named package
+    // could run a `postinstall` on the dev machine — shadcn/Radix/Tailwind are
+    // plain JS and need no lifecycle scripts, so disable them.
+    try argv.appendSlice(gpa, &.{ "npm", "install", "--ignore-scripts" });
+    // Package specs include strings from the shadcn registry's
+    // registryDependencies (untrusted). Reject anything that could be parsed as
+    // an npm flag (leading `-`) or that isn't a plausible package spec, so a
+    // compromised registry item can't inject `--prefix`, `--global`, etc.
+    for (pkgs) |p| {
+        if (!isSafeDepSpec(p)) {
+            say2("akm components: refusing suspicious dependency spec '", p);
+            say("'\n");
+            return error.BadDependencySpec;
+        }
+    }
     try argv.appendSlice(gpa, pkgs);
     say("akm components: npm install …\n");
     var child = std.process.spawn(io, .{
@@ -533,4 +587,22 @@ test "isUnsafeRel rejects traversal and absolute paths" {
 test "dirArg picks the non-flag" {
     try testing.expectEqualStrings(".", dirArg(&.{}));
     try testing.expectEqualStrings("myapp", dirArg(&.{ "--x", "myapp" }));
+}
+
+test "isSafeDepSpec accepts package specs, rejects flag/injection" {
+    try testing.expect(isSafeDepSpec("clsx"));
+    try testing.expect(isSafeDepSpec("@radix-ui/react-slot"));
+    try testing.expect(isSafeDepSpec("lucide-react@0.300.0"));
+    try testing.expect(!isSafeDepSpec("")); // empty
+    try testing.expect(!isSafeDepSpec("--prefix=/tmp")); // npm flag injection
+    try testing.expect(!isSafeDepSpec("-g")); // short flag
+    try testing.expect(!isSafeDepSpec("foo bar")); // whitespace
+    try testing.expect(!isSafeDepSpec("a\nb")); // control char
+    // non-registry sources → RCE via npm lifecycle scripts; reject
+    try testing.expect(!isSafeDepSpec("https://attacker.example/pkg.tgz"));
+    try testing.expect(!isSafeDepSpec("git+ssh://git@evil/x.git"));
+    try testing.expect(!isSafeDepSpec("file:../../etc"));
+    try testing.expect(!isSafeDepSpec("./local"));
+    try testing.expect(!isSafeDepSpec("foo/bar")); // unscoped path
+    try testing.expect(!isSafeDepSpec("@scope/a/b")); // too many slashes
 }

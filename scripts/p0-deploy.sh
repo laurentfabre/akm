@@ -48,14 +48,15 @@ to_psycopg() {
   printf '%s' "$u"
 }
 
-# ── 0. preflight (tools that every path needs) ──────────────────────────────
+# ── 0. preflight (tools needed by EVERY path, incl. DRY_RUN_ONLY) ───────────
 step "Preflight"
 if [ ! -x "$AKM_BIN" ]; then
   have akm || die "akm not found at '$AKM_BIN' (build: cd cli && zig build), or set AKM_BIN"
   AKM_BIN="$(command -v akm)"
 fi
-for t in neonctl npm uv node python3 openssl; do have "$t" || die "missing required tool: $t"; done
-ok "tools present; akm = $AKM_BIN"
+# `akm deploy --dry-run` (the DRY_RUN_ONLY path) needs the build toolchain only.
+for t in npm uv node; do have "$t" || die "missing required tool: $t"; done
+ok "build tools present; akm = $AKM_BIN"
 
 # ── 1. scaffold (only if absent) ────────────────────────────────────────────
 step "Scaffold project"
@@ -72,10 +73,27 @@ step "Install dependencies"
 uv sync >/dev/null && ok "uv sync"
 npm install --silent >/dev/null && ok "npm install"
 
+# ── DRY_RUN_ONLY short-circuit: validate WITHOUT touching the cloud ─────────
+# `akm deploy --dry-run` only validates the wrangler config + bundle (no secrets,
+# no DB), so a validate-only run must NOT create the Neon branch or write
+# .prod.vars. Do that before the cloud-mutating sections below.
+if [ "$DRY_RUN_ONLY" = 1 ]; then
+  step "DRY_RUN_ONLY=1 — skipping Neon branch + .prod.vars (no cloud mutation)"
+  "$AKM_BIN" deploy --dry-run
+  ok "dry-run passed"
+  step "Done (DRY_RUN_ONLY=1)"; exit 0
+fi
+
+# Tools only the REAL path needs (Neon branch + .prod.vars) — checked after the
+# dry-run gate so validate-only runs don't require tools they never use.
+for t in neonctl python3 openssl; do have "$t" || die "missing required tool: $t"; done
+
 # ── 3. ensure a dedicated Neon spike branch + fetch connection strings ──────
 step "Neon branch '$NEON_BRANCH' on project $NEON_PROJECT"
+# Pass the branch name as argv (NOT spliced into the source) — a name with a
+# quote would otherwise inject arbitrary Python.
 if neonctl branches list --project-id "$NEON_PROJECT" -o json \
-   | python3 -c "import sys,json; sys.exit(0 if any(b.get('name')=='$NEON_BRANCH' for b in json.load(sys.stdin)) else 1)"; then
+   | python3 -c "import sys,json; t=sys.argv[1]; sys.exit(0 if any(b.get('name')==t for b in json.load(sys.stdin)) else 1)" "$NEON_BRANCH"; then
   ok "branch exists, reusing"
 else
   neonctl branches create --project-id "$NEON_PROJECT" --name "$NEON_BRANCH" >/dev/null
@@ -94,7 +112,11 @@ if [ -f .prod.vars ] && [ "$FORCE_PRODVARS" != 1 ]; then
 else
   KEY="$(openssl rand -hex 32)"
   umask 077
-  cat > .prod.vars <<EOF
+  # Write to a fresh mktemp file (created 0600 under the umask) and atomically
+  # mv it into place. Writing `cat > .prod.vars` directly would expose secrets in
+  # a pre-existing 0644 file during the window before chmod.
+  tmp="$(mktemp .prod.vars.XXXXXX)"
+  cat > "$tmp" <<EOF
 # akm P0 secrets — gitignored. Generated $(date -u +%FT%TZ).
 AKM_INTERNAL_JWT_KEY="$KEY"
 DATABASE_URL="$POOLED"
@@ -102,20 +124,23 @@ DATABASE_URL_DIRECT="$DIRECT"
 CF_ACCESS_TEAM_DOMAIN="${CF_ACCESS_TEAM_DOMAIN:-CHANGEME-your-team}"
 CF_ACCESS_AUD="${CF_ACCESS_AUD:-CHANGEME-access-app-aud-tag}"
 EOF
-  ok "wrote .prod.vars (mode 600)"
+  mv "$tmp" .prod.vars
+  ok "wrote .prod.vars"
 fi
+# Always tighten the mode — `umask` only covers newly-created files, so a
+# pre-existing .prod.vars (left untouched above, or from an older run) could
+# otherwise stay world-readable with secrets in it.
+chmod 600 .prod.vars
 if grep -q CHANGEME .prod.vars 2>/dev/null; then
   warn "CF_ACCESS_* are placeholders — create the Cloudflare Access app/policy and fill them,"
   warn "  else the Worker rejects every /api/* request with 403 (goal.md §4.5)."
 fi
 
 # ── 5. validate (no account / Docker needed) ────────────────────────────────
+# (DRY_RUN_ONLY already exited above, before any cloud mutation.)
 step "Validate (akm deploy --dry-run)"
 "$AKM_BIN" deploy --dry-run
 ok "dry-run passed"
-if [ "$DRY_RUN_ONLY" = 1 ]; then
-  step "Done (DRY_RUN_ONLY=1)"; exit 0
-fi
 
 # ── 6. real-deploy preflight (stop gracefully, don't error, if not ready) ───
 step "Real-deploy preflight"

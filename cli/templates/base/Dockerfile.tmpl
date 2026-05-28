@@ -15,6 +15,11 @@ COPY pyproject.toml ./
 COPY src ./src
 RUN uv pip install --system .
 
+# Drop privileges: a backend or dependency RCE must not run as root in the
+# container. (Install steps above need root; runtime does not.)
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8000
 
 # Stock ASGI server — no custom supervisor needed (see goal.md §0).

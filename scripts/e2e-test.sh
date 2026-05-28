@@ -40,6 +40,8 @@ hdr()  { printf "\n${c_y}== %s ==${c_0}\n" "$1"; }
 expect_ok() { local n="$1"; shift; local out; if out="$("$@" 2>&1)"; then ok "$n"; else bad "$n" "exit $? :: $(printf '%s' "$out" | tail -1)"; fi; }
 # expect_fail "name" cmd...  — command must exit nonzero
 expect_fail() { local n="$1"; shift; if "$@" >/dev/null 2>&1; then bad "$n" "expected nonzero exit, got 0"; else ok "$n"; fi; }
+# expect_fail_in DIR "name" cmd... — run in DIR (subshell, args quoted), must exit nonzero
+expect_fail_in() { local d="$1" n="$2"; shift 2; if ( cd "$d" && "$@" ) >/dev/null 2>&1; then bad "$n" "expected nonzero exit, got 0"; else ok "$n"; fi; }
 # in_app "name" cmd...       — run inside $APP, must exit 0
 in_app() { local n="$1"; shift; local out; if out="$(cd "$APP" && "$@" 2>&1)"; then ok "$n"; else bad "$n" "exit $? :: $(printf '%s' "$out" | tail -1)"; fi; }
 assert_file() { if [ -e "$1" ]; then ok "file: ${1#"$APP"/}"; else bad "file missing: ${1#"$APP"/}"; fi; }
@@ -69,7 +71,7 @@ else ok "no leftover akm template tokens"; fi
 if find "$APP" -path '*__pkg__*' -o -path '*__slug__*' 2>/dev/null | grep -q .; then
   bad "no leftover __pkg__/__slug__ path tokens"; else ok "no leftover __pkg__/__slug__ path tokens"; fi
 # package.json valid JSON
-expect_ok "package.json is valid JSON" node -e "JSON.parse(require('fs').readFileSync('$APP/package.json','utf8'))"
+expect_ok "package.json is valid JSON" node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$APP/package.json"
 assert_grep "$APP/src/$PKG/backend/app.py" "AKM_OPENAPI_BUILD" "app.py honors AKM_OPENAPI_BUILD"
 
 if [ "${FAST:-0}" = "1" ]; then hdr "FAST mode: skipping dep-install / build / components / deploy blocks"; else
@@ -96,11 +98,11 @@ in_app "frontend build (vite only)" "$BIN" frontend build
 in_app "frontend add clsx --dev" "$BIN" frontend add clsx --dev
 assert_grep "$APP/package.json" '"clsx"' "clsx in package.json"
 # the dev-failure fix: no `dev` script => nonzero exit (not silent success)
-node -e "const p=require('$APP/package.json'); const d={...p.scripts}; delete d.dev; p.scripts=d; require('fs').writeFileSync('$APP/package.json',JSON.stringify(p,null,2))"
+node -e 'const f=process.argv[1],p=require(f);delete p.scripts.dev;require("fs").writeFileSync(f,JSON.stringify(p,null,2))' "$APP/package.json"
 ( cd "$APP" && "$BIN" frontend dev >/dev/null 2>&1 ); rc=$?
 if [ "$rc" -ne 0 ]; then ok "frontend dev surfaces failure (rc=$rc)"; else bad "frontend dev surfaces failure" "got rc=0 on missing dev script"; fi
 # restore dev script for later
-node -e "const p=require('$APP/package.json'); p.scripts.dev='vite'; require('fs').writeFileSync('$APP/package.json',JSON.stringify(p,null,2))"
+node -e 'const f=process.argv[1],p=require(f);p.scripts.dev="vite";require("fs").writeFileSync(f,JSON.stringify(p,null,2))' "$APP/package.json"
 
 # ---------------------------------------------------------------------------
 hdr "components (shadcn over HTTPS)"
@@ -123,14 +125,14 @@ fi  # end non-FAST
 
 # ---------------------------------------------------------------------------
 hdr "negative / arg-validation paths"
-expect_fail "frontend (no subcommand)"        bash -c "cd '$APP' && '$BIN' frontend"
-expect_fail "frontend bogus (unknown subcmd)" bash -c "cd '$APP' && '$BIN' frontend bogus"
-expect_fail "frontend add (no packages)"      bash -c "cd '$APP' && '$BIN' frontend add --dev"
-expect_fail "frontend build (not in project)" bash -c "cd '$WORK' && '$BIN' frontend build"
-expect_fail "build (not in project)"          bash -c "cd '$WORK' && '$BIN' build"
-expect_fail "deploy (not in project)"         bash -c "cd '$WORK' && '$BIN' deploy --dry-run"
-expect_fail "preview create (no --pr)"        bash -c "cd '$APP' && '$BIN' preview create"
-expect_fail "unknown top-level command"       bash -c "'$BIN' frobnicate"
+expect_fail_in "$APP"  "frontend (no subcommand)"        "$BIN" frontend
+expect_fail_in "$APP"  "frontend bogus (unknown subcmd)" "$BIN" frontend bogus
+expect_fail_in "$APP"  "frontend add (no packages)"      "$BIN" frontend add --dev
+expect_fail_in "$WORK" "frontend build (not in project)" "$BIN" frontend build
+expect_fail_in "$WORK" "build (not in project)"          "$BIN" build
+expect_fail_in "$WORK" "deploy (not in project)"         "$BIN" deploy --dry-run
+expect_fail_in "$APP"  "preview create (no --pr)"        "$BIN" preview create
+expect_fail "unknown top-level command"                  "$BIN" frobnicate
 expect_ok   "akm help"                        "$BIN" help
 expect_ok   "akm version"                     "$BIN" version
 # logs prints the §5 caveat before attempting wrangler (assert the caveat text)
@@ -138,11 +140,15 @@ logs_out="$(cd "$APP" && timeout 20 "$BIN" logs 2>&1)";
 if printf '%s' "$logs_out" | grep -q "Observability"; then ok "logs prints §5 container-log caveat"; else bad "logs prints §5 caveat" "caveat text not found"; fi
 
 # ---------------------------------------------------------------------------
-hdr "preview live (opt-in)"
+hdr "preview dry-run must NOT mutate Neon (B1 regression, opt-in)"
 if [ "${RUN_NEON:-0}" = "1" ] && [ -n "${NEON_PROJECT_ID:-}" ]; then
-  PRID="e2e$$"
-  in_app "preview create --dry-run (live Neon branch)" "$BIN" preview create --pr "$PRID" --neon-project "$NEON_PROJECT_ID" --dry-run
-  in_app "preview destroy (cleanup branch)"            "$BIN" preview destroy --pr "$PRID" --neon-project "$NEON_PROJECT_ID"
+  PRID="e2e$$"; BR="akm-pr-$PRID"
+  in_app "preview create --dry-run runs" "$BIN" preview create --pr "$PRID" --neon-project "$NEON_PROJECT_ID" --dry-run
+  if neonctl branches list --project-id "$NEON_PROJECT_ID" --output json 2>/dev/null | grep -q "\"name\": \"$BR\""; then
+    bad "dry-run created NO Neon branch" "branch $BR exists — dry-run mutated Neon!"
+    neonctl branches delete "$BR" --project-id "$NEON_PROJECT_ID" 2>/dev/null || true
+  else ok "dry-run created NO Neon branch ($BR absent)"; fi
+  in_app "preview destroy --dry-run runs (no delete)" "$BIN" preview destroy --pr "$PRID" --neon-project "$NEON_PROJECT_ID" --dry-run
 else
   skip "live preview (set RUN_NEON=1 NEON_PROJECT_ID=<id>)"
 fi

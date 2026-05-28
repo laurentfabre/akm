@@ -10,4 +10,5 @@ CF_ACCESS_TEAM_DOMAIN="myteam"
 CF_ACCESS_AUD="your-access-app-aud-tag"
 
 # Shared HMAC key for the internal X-Akm-Identity JWT. Must match Worker + container.
-AKM_INTERNAL_JWT_KEY="dev-only-change-me"
+# Needs >=32 chars (the backend rejects shorter keys). Generate: openssl rand -hex 32
+AKM_INTERNAL_JWT_KEY="dev0000000000000000000000000000000000000000000000000000000change"

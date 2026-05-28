@@ -5,7 +5,7 @@ function App() {
   const [health, setHealth] = useState<string>("…");
   useEffect(() => {
     fetch("/api/health")
-      .then((r) => r.json())
+      .then((r) => r.json() as Promise<{ status: string }>)
       .then((d) => setHealth(d.status))
       .catch(() => setHealth("unreachable"));
   }, []);

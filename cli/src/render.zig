@@ -107,7 +107,12 @@ fn renderInto(
 
 /// Skip the body of a non-taken block, honoring nesting of the same kind.
 fn skipBlock(tmpl: []const u8, pos: *usize, kind: []const u8) Error!void {
+    // Track ALL nested block kinds with a stack (not just `kind`), so an
+    // interleaved tag like `{{#if a}}{{#unless b}}{{/if}}` is reported as
+    // unbalanced rather than silently closed at the wrong level.
+    var stack: [64][]const u8 = undefined;
     var depth: usize = 1;
+    stack[0] = kind;
     while (pos.* < tmpl.len) {
         const open = std.mem.indexOfPos(u8, tmpl, pos.*, "{{") orelse return Error.UnbalancedBlock;
         const close = std.mem.indexOfPos(u8, tmpl, open + 2, "}}") orelse return Error.UnclosedTag;
@@ -117,13 +122,15 @@ fn skipBlock(tmpl: []const u8, pos: *usize, kind: []const u8) Error!void {
         if (raw[0] == '#') {
             const spec = std.mem.trim(u8, raw[1..], " \t");
             const k, _ = splitKeyword(spec) orelse continue;
-            if (std.mem.eql(u8, k, kind)) depth += 1;
+            if (depth >= stack.len) return Error.UnbalancedBlock; // nesting too deep
+            stack[depth] = k;
+            depth += 1;
         } else if (raw[0] == '/') {
             const k = std.mem.trim(u8, raw[1..], " \t");
-            if (std.mem.eql(u8, k, kind)) {
-                depth -= 1;
-                if (depth == 0) return;
-            }
+            // A close must match the innermost open (LIFO), regardless of kind.
+            if (depth == 0 or !std.mem.eql(u8, stack[depth - 1], k)) return Error.UnbalancedBlock;
+            depth -= 1;
+            if (depth == 0) return;
         }
     }
     return Error.UnbalancedBlock;
@@ -172,6 +179,20 @@ test "unless and nesting" {
     , &ctx);
     defer gpa.free(r);
     try std.testing.expectEqualStrings("ui[no-auth]", r);
+}
+
+test "skipBlock rejects cross-kind mis-nesting in a skipped branch" {
+    const gpa = std.testing.allocator;
+    var ctx = Context.init(gpa);
+    defer ctx.deinit();
+    try ctx.put("off", ""); // falsy → the if-body is skipped
+    try ctx.put("x", "true");
+    // The skipped branch closes `if` while `unless` is still open → unbalanced.
+    try std.testing.expectError(Error.UnbalancedBlock, render(gpa, "{{#if off}}{{#unless x}}{{/if}}OK", &ctx));
+    // Properly nested skip still works.
+    const r = try render(gpa, "{{#if off}}{{#unless x}}no{{/unless}}{{/if}}OK", &ctx);
+    defer gpa.free(r);
+    try std.testing.expectEqualStrings("OK", r);
 }
 
 test "unknown variable errors" {
