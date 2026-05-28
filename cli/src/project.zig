@@ -34,14 +34,23 @@ pub fn discoverPkg(gpa: std.mem.Allocator, io: std.Io, proj: std.Io.Dir) ![]u8 {
     };
     defer src.close(io);
 
+    // Iterate fully and require exactly one match — don't silently pick the
+    // first of several (iteration order isn't stable).
+    var found: ?[]u8 = null;
+    errdefer if (found) |f| gpa.free(f);
     var it = src.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .directory) continue;
         var buf: [512]u8 = undefined;
         const probe = std.fmt.bufPrint(&buf, "src/{s}/backend/app.py", .{entry.name}) catch continue;
         proj.access(io, probe, .{}) catch continue;
-        return gpa.dupe(u8, entry.name);
+        if (found != null) {
+            say("akm: multiple backend packages under src/ — expected exactly one src/<pkg>/backend/app.py.\n");
+            return error.AmbiguousPackage;
+        }
+        found = try gpa.dupe(u8, entry.name);
     }
+    if (found) |f| return f;
     say("akm: could not find a backend package (src/<pkg>/backend/app.py).\n");
     return error.NoProject;
 }

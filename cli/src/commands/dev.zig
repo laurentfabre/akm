@@ -249,7 +249,14 @@ fn migrate(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, env: *const Envi
     if (res.term == .exited and res.term.exited == 0) {
         say("akm dev: alembic upgrade head ok\n");
     } else {
-        say("akm dev: alembic upgrade head reported issues (continuing)\n");
+        // Best-effort (a brand-new branch may have no revisions yet), but surface
+        // the actual stderr so a genuinely broken migration isn't opaque.
+        say("akm dev: alembic upgrade head reported issues (continuing):\n");
+        const e = std.mem.trim(u8, res.stderr, " \t\r\n");
+        if (e.len > 0) {
+            say(e);
+            say("\n");
+        }
     }
 }
 
