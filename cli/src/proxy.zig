@@ -66,8 +66,21 @@ pub fn run(io: std.Io, cfg: Config, stop: *std.atomic.Value(bool)) !void {
             stream.close(io);
             break;
         }
-        // Detach: the handler owns the connection's lifetime and resources.
+        // Bound concurrent handlers. Each connection is one OS thread plus two
+        // `buf_size` buffers and blocks in header reads with no per-read deadline,
+        // so a slow/withholding peer could otherwise exhaust threads/fds/memory.
+        // This is a localhost-only dev proxy (attacker needs local code-exec), so
+        // a hard cap is a sufficient, cheap bound; refuse beyond it.
+        if (active_conns.fetchAdd(1, .acq_rel) >= max_conns) {
+            _ = active_conns.fetchSub(1, .acq_rel);
+            std.log.warn("akm dev: >{d} concurrent connections, refusing", .{max_conns});
+            stream.close(io);
+            continue;
+        }
+        // Detach: the handler owns the connection's lifetime and resources, and
+        // releases its slot (active_conns) on exit.
         const t = std.Thread.spawn(.{}, connThread, .{ io, cfg, stream }) catch |err| {
+            _ = active_conns.fetchSub(1, .acq_rel);
             std.log.warn("akm dev: cannot spawn handler: {s}", .{@errorName(err)});
             stream.close(io);
             continue;
@@ -76,7 +89,13 @@ pub fn run(io: std.Io, cfg: Config, stop: *std.atomic.Value(bool)) !void {
     }
 }
 
+/// Max concurrent connection handlers (see the accept loop). A localhost dev
+/// proxy never needs many; the cap bounds resource exhaustion.
+const max_conns = 256;
+var active_conns = std.atomic.Value(usize).init(0);
+
 fn connThread(io: std.Io, cfg: Config, client: net.Stream) void {
+    defer _ = active_conns.fetchSub(1, .acq_rel); // release the slot taken in run()
     defer client.close(io);
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -141,7 +160,12 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
         if (eqlIc(name, "content-length")) {
             // A present-but-malformed Content-Length must fail, not silently
             // become "no length" (that's a request-smuggling primitive).
-            content_length = std.fmt.parseInt(u64, value, 10) catch return error.BadRequest;
+            const parsed = std.fmt.parseInt(u64, value, 10) catch return error.BadRequest;
+            // A *conflicting* duplicate Content-Length is the classic CL/CL
+            // smuggling vector (RFC 9112 §6.3): reject rather than last-wins.
+            if (content_length) |existing| {
+                if (existing != parsed) return error.BadRequest;
+            } else content_length = parsed;
         } else if (eqlIc(name, "transfer-encoding") and containsIc(value, "chunked")) {
             chunked = true;
         } else if (eqlIc(name, "connection") and containsIc(value, "upgrade")) {
@@ -270,7 +294,10 @@ fn serve(
     }
 
     // 101 Switching Protocols → bidirectional byte tunnel (WebSocket / HMR).
-    if (status == 101 or is_upgrade) {
+    // ONLY a real 101 may tunnel: if the client asked to upgrade but the upstream
+    // declined (200/400/404/…), tunneling raw would ignore the response framing
+    // and hang the connection — fall through to a normal framed relay instead.
+    if (status == 101) {
         try cw.flush();
         tunnel(io, client, upstream, cr, cw, ur, uw);
         return;
@@ -302,10 +329,13 @@ fn copyChunked(src: *std.Io.Reader, dst: *std.Io.Writer) !void {
         const size = std.fmt.parseInt(u64, t[0..hex_end], 16) catch return error.BadChunk;
         if (size == 0) {
             // Trailer section: copy header lines through the terminating blank line.
+            var trailers: usize = 0;
             while (true) {
                 const line = try src.takeDelimiterInclusive('\n');
                 try dst.writeAll(line);
                 if (trimCrlf(line).len == 0) break;
+                trailers += 1;
+                if (trailers > max_headers) return error.TooManyHeaders; // bound trailers
             }
             return;
         }
@@ -464,6 +494,11 @@ test "parseRequestHead: rejects malformed/smuggling/oversized heads" {
     try testing.expectError(error.BadRequest, parseHeadTest(a, "GET / HTTP/1.1\r\nContent-Length: abc\r\n\r\n"));
     // CL + chunked together (smuggling)
     try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"));
+    // conflicting duplicate Content-Length (CL/CL smuggling)
+    try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 50\r\n\r\n"));
+    // identical duplicate CL is tolerated (treated as one)
+    const dup = try parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n");
+    try testing.expectEqual(@as(?u64, 5), dup.content_length);
     // request line with no target
     try testing.expectError(error.BadRequest, parseHeadTest(a, "GET\r\n\r\n"));
     // too many headers

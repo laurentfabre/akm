@@ -174,9 +174,12 @@ fn parseCreate(gpa: std.mem.Allocator, json_bytes: []const u8) Error!Branch {
     const params = obj(first.get("connection_parameters")) orelse return Error.NeonOutputUnexpected;
     const host = str(params.get("host")) orelse return Error.NeonOutputUnexpected;
     const pooler_host = str(params.get("pooler_host")) orelse return Error.NeonOutputUnexpected;
+    if (host.len == 0 or pooler_host.len == 0) return Error.NeonOutputUnexpected;
 
-    // Pooled URL = direct URL with the host swapped for the -pooler host.
-    const pooled_raw = try replaceOwned(gpa, direct_raw, host, pooler_host);
+    // Pooled URL = direct URL with ONLY the authority host swapped for the
+    // -pooler host. A blind string replace (the old behavior) would corrupt a
+    // URL where the host substring also appears in the password, db name, or query.
+    const pooled_raw = try swapHost(gpa, direct_raw, host, pooler_host);
     defer gpa.free(pooled_raw);
 
     const direct_url = try toPsycopgUrl(gpa, direct_raw);
@@ -199,14 +202,28 @@ fn toPsycopgUrl(gpa: std.mem.Allocator, url: []const u8) ![]u8 {
         }
     }
     if (std.mem.startsWith(u8, url, want)) return gpa.dupe(u8, url);
-    return gpa.dupe(u8, url); // unknown scheme — pass through unchanged
+    // Unknown scheme: refuse rather than hand malformed CLI output to the DB layer.
+    return Error.NeonOutputUnexpected;
 }
 
-fn replaceOwned(gpa: std.mem.Allocator, haystack: []const u8, needle: []const u8, repl: []const u8) ![]u8 {
-    const n = std.mem.replacementSize(u8, haystack, needle, repl);
-    const out = try gpa.alloc(u8, n);
-    _ = std.mem.replace(u8, haystack, needle, repl, out);
-    return out;
+/// Swap ONLY the authority host of a `scheme://[user[:pass]@]host[:port][/...]`
+/// URL with `repl`. Validates the parsed host equals `host` (Neon's reported
+/// host); refuses (NeonOutputUnexpected) if the URL shape is unexpected. This
+/// avoids corrupting credentials/db-name/query that may contain the host substring.
+fn swapHost(gpa: std.mem.Allocator, url: []const u8, host: []const u8, repl: []const u8) ![]u8 {
+    const sep = "://";
+    const sidx = std.mem.indexOf(u8, url, sep) orelse return Error.NeonOutputUnexpected;
+    const auth_start = sidx + sep.len;
+    const rest = url[auth_start..];
+    const auth_len = std.mem.indexOfAny(u8, rest, "/?") orelse rest.len;
+    const authority = rest[0..auth_len];
+    // host begins after the last '@' (userinfo), if any, and ends at ':' (port).
+    const host_off = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| at + 1 else 0;
+    const hostport = authority[host_off..];
+    const host_len = std.mem.indexOfScalar(u8, hostport, ':') orelse hostport.len;
+    if (!std.mem.eql(u8, hostport[0..host_len], host)) return Error.NeonOutputUnexpected;
+    const start = auth_start + host_off;
+    return std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ url[0..start], repl, url[start + host_len ..] });
 }
 
 // JSON Value navigation helpers (tolerant — return null on type mismatch).
@@ -278,6 +295,25 @@ test "parseCreate is OOM-safe (no leak; returns OutOfMemory, not a parse error)"
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fn.run, .{sample});
+}
+
+test "swapHost replaces only the authority host, not host substrings elsewhere" {
+    const gpa = testing.allocator;
+    // The host token also appears inside the password AND the db-name path.
+    const url = "postgresql://u:h.neon.tech@h.neon.tech:5432/h.neon.tech?sslmode=require";
+    const out = try swapHost(gpa, url, "h.neon.tech", "h-pooler.neon.tech");
+    defer gpa.free(out);
+    try testing.expectEqualStrings(
+        "postgresql://u:h.neon.tech@h-pooler.neon.tech:5432/h.neon.tech?sslmode=require",
+        out,
+    );
+    // host shape doesn't match Neon's reported host → refuse to guess
+    try testing.expectError(Error.NeonOutputUnexpected, swapHost(gpa, "postgresql://other/db", "h.neon.tech", "x"));
+}
+
+test "toPsycopgUrl rejects unknown scheme" {
+    const gpa = testing.allocator;
+    try testing.expectError(Error.NeonOutputUnexpected, toPsycopgUrl(gpa, "mysql://h/db"));
 }
 
 test "parseCreate rejects malformed output" {

@@ -22,6 +22,15 @@ from .config import settings
 ISS = "akm-worker"
 AUD = "akm-backend"
 
+# Internal tokens are short-lived: both minters (Worker auth.ts, Zig jwt.zig)
+# emit `exp = iat + 120`. The backend enforces this window itself so a leaked or
+# misconfigured-minter token can't claim a long lifetime (defense in depth).
+MAX_TTL_SECONDS = 120
+CLOCK_SKEW_SECONDS = 60
+# A short HMAC key makes forgery cheap; require real key material (a hex/base64
+# 32-byte secret is ≥32 chars). The minters use 64-hex-char keys.
+MIN_KEY_LEN = 32
+
 
 @dataclass(frozen=True)
 class Principal:
@@ -73,10 +82,19 @@ def _verify(token: str, key: str) -> dict:
         raise ValueError("bad iss")
     if claims.get("aud") != AUD:
         raise ValueError("bad aud")
-    # `exp` is mandatory and numeric — a token without it must not be accepted.
+    # `iat` is mandatory and numeric — required to bound the lifetime below, and
+    # must not be in the future (beyond clock skew).
+    iat = claims.get("iat")
+    if not isinstance(iat, (int, float)) or isinstance(iat, bool) or iat > now + CLOCK_SKEW_SECONDS:
+        raise ValueError("missing or invalid iat")
+    # `exp` is mandatory, numeric, and unexpired.
     exp = claims.get("exp")
     if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp <= now:
         raise ValueError("missing or expired exp")
+    # Enforce the replay window at the trust boundary: even a validly-signed token
+    # may not claim a lifetime longer than the contract (≤120s + skew).
+    if exp - iat > MAX_TTL_SECONDS + CLOCK_SKEW_SECONDS:
+        raise ValueError("token lifetime too long")
     nbf = claims.get("nbf")
     if isinstance(nbf, (int, float)) and not isinstance(nbf, bool) and nbf > now + 60:
         raise ValueError("not yet valid")
@@ -96,8 +114,8 @@ def get_principal(
 ) -> Principal:
     if not x_akm_identity:
         raise HTTPException(status_code=401, detail="missing identity")
-    if not settings.internal_jwt_key:
-        raise HTTPException(status_code=500, detail="AKM_INTERNAL_JWT_KEY not configured")
+    if not settings.internal_jwt_key or len(settings.internal_jwt_key) < MIN_KEY_LEN:
+        raise HTTPException(status_code=500, detail="AKM_INTERNAL_JWT_KEY missing or too short")
     try:
         claims = _verify(x_akm_identity, settings.internal_jwt_key)
     except ValueError as exc:

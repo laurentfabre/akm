@@ -138,11 +138,15 @@ logs_out="$(cd "$APP" && timeout 20 "$BIN" logs 2>&1)";
 if printf '%s' "$logs_out" | grep -q "Observability"; then ok "logs prints §5 container-log caveat"; else bad "logs prints §5 caveat" "caveat text not found"; fi
 
 # ---------------------------------------------------------------------------
-hdr "preview live (opt-in)"
+hdr "preview dry-run must NOT mutate Neon (B1 regression, opt-in)"
 if [ "${RUN_NEON:-0}" = "1" ] && [ -n "${NEON_PROJECT_ID:-}" ]; then
-  PRID="e2e$$"
-  in_app "preview create --dry-run (live Neon branch)" "$BIN" preview create --pr "$PRID" --neon-project "$NEON_PROJECT_ID" --dry-run
-  in_app "preview destroy (cleanup branch)"            "$BIN" preview destroy --pr "$PRID" --neon-project "$NEON_PROJECT_ID"
+  PRID="e2e$$"; BR="akm-pr-$PRID"
+  in_app "preview create --dry-run runs" "$BIN" preview create --pr "$PRID" --neon-project "$NEON_PROJECT_ID" --dry-run
+  if neonctl branches list --project-id "$NEON_PROJECT_ID" --output json 2>/dev/null | grep -q "\"name\": \"$BR\""; then
+    bad "dry-run created NO Neon branch" "branch $BR exists — dry-run mutated Neon!"
+    neonctl branches delete "$BR" --project-id "$NEON_PROJECT_ID" 2>/dev/null || true
+  else ok "dry-run created NO Neon branch ($BR absent)"; fi
+  in_app "preview destroy --dry-run runs (no delete)" "$BIN" preview destroy --pr "$PRID" --neon-project "$NEON_PROJECT_ID" --dry-run
 else
   skip "live preview (set RUN_NEON=1 NEON_PROJECT_ID=<id>)"
 fi

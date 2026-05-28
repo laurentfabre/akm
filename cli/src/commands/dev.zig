@@ -129,6 +129,14 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     };
     const vite_argv = [_][]const u8{ "npm", "run", "dev", "--", "--port", vp, "--strictPort" };
 
+    // Install the signal handler BEFORE spawning children. Otherwise a Ctrl-C in
+    // the window between spawn and handler-install hits the default disposition,
+    // kills the parent without running `defer shutdownChildren`, and orphans the
+    // (separate-process-group) uvicorn/Vite. The handler only sets `should_stop`;
+    // if it fires before the proxy starts, proxy.run returns at once and the
+    // defer below tears the children down.
+    installSignalHandlers();
+
     var backend = spawnChild(io, opts.dir, &env, &backend_argv) catch |err| {
         say2("akm dev: failed to start uvicorn (is `uv` installed?): ", @errorName(err));
         say("\n");
@@ -142,8 +150,8 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer shutdownChildren(io, &backend, &vite);
 
-    // ── signals + watcher, then run the proxy (blocks) ────────────────────
-    installSignalHandlers();
+    // ── watcher, then run the proxy (blocks) ──────────────────────────────
+    // (signal handlers were installed before the children spawned, above)
     const watch = try std.Thread.spawn(.{}, watcher, .{ io, opts.proxy_port });
 
     printBanner(opts, pkg);

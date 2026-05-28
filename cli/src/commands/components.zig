@@ -331,10 +331,30 @@ fn patch(
     say("\n");
 }
 
+/// A plausible npm package spec: non-empty, not an option (no leading `-`), no
+/// whitespace/control bytes. Tight enough to block flag injection from an
+/// untrusted registry while accepting `@scope/name`, `name@version`, etc.
+fn isSafeDepSpec(p: []const u8) bool {
+    if (p.len == 0 or p[0] == '-') return false;
+    for (p) |c| if (c <= ' ' or c == 0x7f) return false;
+    return true;
+}
+
 fn npmInstall(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, pkgs: []const []const u8) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.appendSlice(gpa, &.{ "npm", "install" });
+    // Package specs include strings from the shadcn registry's
+    // registryDependencies (untrusted). Reject anything that could be parsed as
+    // an npm flag (leading `-`) or that isn't a plausible package spec, so a
+    // compromised registry item can't inject `--prefix`, `--global`, etc.
+    for (pkgs) |p| {
+        if (!isSafeDepSpec(p)) {
+            say2("akm components: refusing suspicious dependency spec '", p);
+            say("'\n");
+            return error.BadDependencySpec;
+        }
+    }
     try argv.appendSlice(gpa, pkgs);
     say("akm components: npm install …\n");
     var child = std.process.spawn(io, .{
@@ -533,4 +553,15 @@ test "isUnsafeRel rejects traversal and absolute paths" {
 test "dirArg picks the non-flag" {
     try testing.expectEqualStrings(".", dirArg(&.{}));
     try testing.expectEqualStrings("myapp", dirArg(&.{ "--x", "myapp" }));
+}
+
+test "isSafeDepSpec accepts package specs, rejects flag/injection" {
+    try testing.expect(isSafeDepSpec("clsx"));
+    try testing.expect(isSafeDepSpec("@radix-ui/react-slot"));
+    try testing.expect(isSafeDepSpec("lucide-react@0.300.0"));
+    try testing.expect(!isSafeDepSpec("")); // empty
+    try testing.expect(!isSafeDepSpec("--prefix=/tmp")); // npm flag injection
+    try testing.expect(!isSafeDepSpec("-g")); // short flag
+    try testing.expect(!isSafeDepSpec("foo bar")); // whitespace
+    try testing.expect(!isSafeDepSpec("a\nb")); // control char
 }

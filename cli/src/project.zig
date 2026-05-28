@@ -48,11 +48,42 @@ pub fn discoverPkg(gpa: std.mem.Allocator, io: std.Io, proj: std.Io.Dir) ![]u8 {
             say("akm: multiple backend packages under src/ — expected exactly one src/<pkg>/backend/app.py.\n");
             return error.AmbiguousPackage;
         }
+        // The name is interpolated into `python -c "from <pkg>.backend.app …"`
+        // by build/deploy — reject anything that isn't a plain Python identifier
+        // (blocks code injection via a crafted dir name + catches names like
+        // `my-app` that would only fail later at import).
+        if (!isValidPkgName(entry.name)) {
+            say("akm: backend package directory '");
+            say(entry.name);
+            say("' is not a valid Python identifier (use letters/digits/underscore, not starting with a digit, not a keyword).\n");
+            return error.InvalidPackageName;
+        }
         found = try gpa.dupe(u8, entry.name);
     }
     if (found) |f| return f;
     say("akm: could not find a backend package (src/<pkg>/backend/app.py).\n");
     return error.NoProject;
+}
+
+/// Is `name` a plain Python identifier (and not a keyword)? Used to validate a
+/// discovered backend package dir before it is interpolated into `python -c`.
+pub fn isValidPkgName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    return !isPyKeyword(name);
+}
+
+const py_keywords = [_][]const u8{
+    "False",  "None",   "True",    "and",      "as",       "assert", "async",
+    "await",  "break",  "class",   "continue", "def",      "del",    "elif",
+    "else",   "except", "finally", "for",      "from",     "global", "if",
+    "import", "in",     "is",      "lambda",   "nonlocal", "not",    "or",
+    "pass",   "raise",  "return",  "try",      "while",    "with",   "yield",
+};
+fn isPyKeyword(s: []const u8) bool {
+    for (py_keywords) |kw| if (std.mem.eql(u8, s, kw)) return true;
+    return false;
 }
 
 /// One `KEY=value` binding parsed from a `.dev.vars`/`.prod.vars`-style file.
@@ -75,6 +106,11 @@ pub fn parseVars(gpa: std.mem.Allocator, bytes: []const u8) ![]Var {
         var value = std.mem.trim(u8, line[eq + 1 ..], " \t");
         if (value.len >= 2 and (value[0] == '"' or value[0] == '\'') and value[value.len - 1] == value[0]) {
             value = value[1 .. value.len - 1];
+        }
+        // A NUL would panic `Environ.Map.put` (key) or silently truncate the
+        // child env (value) — reject the file rather than crash `akm dev`.
+        if (std.mem.indexOfScalar(u8, key, 0) != null or std.mem.indexOfScalar(u8, value, 0) != null) {
+            return error.InvalidVarByte;
         }
         try list.append(gpa, .{ .key = key, .value = value });
     }
@@ -100,6 +136,25 @@ test "parseVars is OOM-safe (no leak on allocation failure)" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fn.run, .{});
+}
+
+test "isValidPkgName: identifiers, rejects, keywords" {
+    try std.testing.expect(isValidPkgName("app"));
+    try std.testing.expect(isValidPkgName("my_app2"));
+    try std.testing.expect(isValidPkgName("_private"));
+    try std.testing.expect(!isValidPkgName("")); // empty
+    try std.testing.expect(!isValidPkgName("2cool")); // leading digit
+    try std.testing.expect(!isValidPkgName("my-app")); // hyphen
+    try std.testing.expect(!isValidPkgName("a.b")); // dot (import-path injection)
+    try std.testing.expect(!isValidPkgName("a b")); // space
+    try std.testing.expect(!isValidPkgName("x\nimport os")); // newline injection
+    try std.testing.expect(!isValidPkgName("class")); // python keyword
+}
+
+test "parseVars rejects NUL bytes (would panic Environ.Map.put)" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidVarByte, parseVars(gpa, "BAD\x00KEY=value\n"));
+    try std.testing.expectError(error.InvalidVarByte, parseVars(gpa, "KEY=va\x00lue\n"));
 }
 
 test "parseVars: comments, quotes, whitespace" {

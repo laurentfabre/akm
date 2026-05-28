@@ -74,8 +74,10 @@ npm install --silent >/dev/null && ok "npm install"
 
 # ── 3. ensure a dedicated Neon spike branch + fetch connection strings ──────
 step "Neon branch '$NEON_BRANCH' on project $NEON_PROJECT"
+# Pass the branch name as argv (NOT spliced into the source) — a name with a
+# quote would otherwise inject arbitrary Python.
 if neonctl branches list --project-id "$NEON_PROJECT" -o json \
-   | python3 -c "import sys,json; sys.exit(0 if any(b.get('name')=='$NEON_BRANCH' for b in json.load(sys.stdin)) else 1)"; then
+   | python3 -c "import sys,json; t=sys.argv[1]; sys.exit(0 if any(b.get('name')==t for b in json.load(sys.stdin)) else 1)" "$NEON_BRANCH"; then
   ok "branch exists, reusing"
 else
   neonctl branches create --project-id "$NEON_PROJECT" --name "$NEON_BRANCH" >/dev/null

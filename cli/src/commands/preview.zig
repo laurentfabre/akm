@@ -72,25 +72,29 @@ fn create(
     say2("akm preview: creating preview for PR #", opts.pr);
     say("\n");
 
-    // 1. Per-PR Neon branch (real, idempotent).
-    say2("akm preview: ensuring Neon branch ", branch);
-    say(" …\n");
-    var br = try neon.ensure(gpa, io, neon_project, branch);
-    defer br.deinit();
-
-    // 2. Build artifacts.
+    // 1. Build artifacts — local only, no cloud mutation; also gives the
+    //    wrangler bundle/assets that `deploy --dry-run` validates.
     const pkg = try project.discoverPkg(gpa, io, proj);
     defer gpa.free(pkg);
     if (!opts.skip_build) try build.buildArtifacts(gpa, io, proj, opts.dir, pkg, false);
 
-    // 3. Secrets = base file (AKM key + CF_ACCESS) + the PR branch's DB URLs.
+    // 2. Cloud mutations (Neon branch + secret upload) happen ONLY for a real
+    //    run. `--dry-run` must not create a branch or push secrets — it only
+    //    validates the wrangler deploy below. (Was a BLOCKER: dry-run created
+    //    the branch via neon.ensure before this check.)
     if (opts.dry_run) {
-        say("akm preview: --dry-run, skipping secret upload\n");
+        say2("akm preview: --dry-run — would ensure Neon branch ", branch);
+        say(" and upload secrets (skipped)\n");
     } else {
+        say2("akm preview: ensuring Neon branch ", branch);
+        say(" …\n");
+        var br = try neon.ensure(gpa, io, neon_project, branch);
+        defer br.deinit();
+        // Secrets = base file (AKM key + CF_ACCESS) + this PR branch's DB URLs.
         try pushSecrets(gpa, io, opts, worker, br);
     }
 
-    // 4. Deploy the named per-PR Worker.
+    // 3. Deploy the named per-PR Worker (validated, not shipped, under --dry-run).
     try wrangler(gpa, io, opts.dir, &.{ "deploy", "--name", worker }, opts.dry_run);
 
     say2("\nakm preview: PR #", opts.pr);
@@ -98,7 +102,7 @@ fn create(
     say2(", Neon branch ", branch);
     say("\n");
     if (opts.dry_run) {
-        say("akm preview: dry-run OK (Neon branch made; wrangler deploy validated, not shipped).\n");
+        say("akm preview: dry-run OK (no cloud changes; wrangler deploy validated, not shipped).\n");
     } else {
         say2("akm preview: live at https://", worker);
         say(".<your-subdomain>.workers.dev (behind Cloudflare Access)\n");
@@ -116,13 +120,16 @@ fn destroy(
     say2("akm preview: destroying preview for PR #", opts.pr);
     say("\n");
     if (opts.dry_run) {
-        say2("akm preview: --dry-run, would `wrangler delete --name ", worker);
-        say("`\n");
-    } else {
-        // Best-effort: tear down the Worker, then the branch, regardless of order outcome.
-        wrangler(gpa, io, opts.dir, &.{ "delete", "--name", worker }, false) catch
-            say("akm preview: wrangler delete failed (already gone?) — continuing\n");
+        // Dry-run must not delete anything (was a BLOCKER: neon.delete ran
+        // unconditionally, so `destroy --dry-run` deleted the real branch).
+        say2("akm preview: --dry-run — would `wrangler delete --name ", worker);
+        say2("` and delete Neon branch ", branch);
+        say(" (no changes made)\n");
+        return;
     }
+    // Best-effort: tear down the Worker, then the branch, regardless of order outcome.
+    wrangler(gpa, io, opts.dir, &.{ "delete", "--name", worker }, false) catch
+        say("akm preview: wrangler delete failed (already gone?) — continuing\n");
     say2("akm preview: deleting Neon branch ", branch);
     say(" …\n");
     neon.delete(gpa, io, neon_project, branch);
