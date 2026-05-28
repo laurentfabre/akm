@@ -46,8 +46,12 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var vars: []project.Var = &.{};
     defer if (vars.len > 0) gpa.free(vars);
     if (opts.secrets_file) |sf| {
-        secrets_bytes = std.Io.Dir.cwd().readFileAlloc(io, sf, gpa, .limited(1 << 20)) catch {
-            say2("akm deploy: cannot read secrets file '", sf);
+        // Resolve --secrets against the PROJECT dir, not the caller's cwd, so
+        // `akm deploy apps/foo --secrets .prod.vars` reads apps/foo/.prod.vars
+        // (matching where everything else for this project runs). Absolute
+        // paths still work (openat ignores the base dir for them).
+        secrets_bytes = proj.readFileAlloc(io, sf, gpa, .limited(1 << 20)) catch {
+            say2("akm deploy: cannot read secrets file (relative to the project dir) '", sf);
             say("'\n");
             return error.SecretsFile;
         };

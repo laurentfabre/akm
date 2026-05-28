@@ -28,6 +28,10 @@ const buf_size = 32 * 1024;
 /// Upper bound on header lines per request/response — bounds the parse loop
 /// against a client/upstream that streams headers forever (arena OOM).
 const max_headers = 200;
+/// Aggregate cap on the request head (request line + all header lines). Bounds
+/// per-connection memory regardless of header *count* (200 × ~32KiB would be
+/// huge × many connections).
+const max_head_bytes = 64 * 1024;
 
 pub const Config = struct {
     proxy_port: u16,
@@ -141,12 +145,21 @@ const RequestHead = struct {
     is_upgrade: bool,
 };
 
+/// True iff `s` is non-empty and all ASCII digits (a valid HTTP token like
+/// Content-Length: 1*DIGIT). Rejects empty, signs (`+5`/`-0`), and stray bytes.
+fn isAllDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
 /// Read and validate an HTTP/1.1 request head from `r`. Pure (no sockets): the
 /// reader can be a real connection or `std.Io.Reader.fixed(bytes)` in tests.
 /// Enforces the framing rules the proxy depends on (bounded headers, no
 /// malformed/ambiguous Content-Length) so smuggling can't slip through.
 fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
     const request_line = try a.dupe(u8, trimCrlf(try r.takeDelimiterInclusive('\n')));
+    var head_bytes: usize = request_line.len; // aggregate head size cap (see below)
     var rl = std.mem.tokenizeScalar(u8, request_line, ' ');
     const method = rl.next() orelse return error.BadRequest;
     const target = rl.next() orelse return error.BadRequest;
@@ -162,13 +175,18 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
         const line = trimCrlf(try r.takeDelimiterInclusive('\n'));
         if (line.len == 0) break;
         if (headers.items.len >= max_headers) return error.TooManyHeaders; // bound the loop
+        head_bytes += line.len;
+        if (head_bytes > max_head_bytes) return error.HeadTooLarge; // bound total bytes, not just count
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = std.mem.trim(u8, line[0..colon], " \t");
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
 
         if (eqlIc(name, "content-length")) {
-            // A present-but-malformed Content-Length must fail, not silently
-            // become "no length" (that's a request-smuggling primitive).
+            // Content-Length must be 1*DIGIT (RFC 9112 §6.1). parseInt alone
+            // accepts `+5`/`-0`, a parser-differential smuggling surface — so
+            // require bare digits first. A present-but-malformed CL must fail,
+            // not silently become "no length".
+            if (!isAllDigits(value)) return error.BadRequest;
             const parsed = std.fmt.parseInt(u64, value, 10) catch return error.BadRequest;
             // A *conflicting* duplicate Content-Length is the classic CL/CL
             // smuggling vector (RFC 9112 §6.3): reject rather than last-wins.
@@ -509,6 +527,9 @@ test "parseRequestHead: rejects malformed/smuggling/oversized heads" {
     try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 50\r\n\r\n"));
     // ANY Transfer-Encoding (not just chunked) + Content-Length is smuggling
     try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: gzip\r\n\r\n"));
+    // Content-Length must be bare digits — a sign is a parser-differential vector
+    try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\n"));
+    try testing.expectError(error.BadRequest, parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: -0\r\n\r\n"));
     // identical duplicate CL is tolerated (treated as one)
     const dup = try parseHeadTest(a, "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n");
     try testing.expectEqual(@as(?u64, 5), dup.content_length);

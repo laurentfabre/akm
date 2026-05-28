@@ -62,6 +62,13 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         else => return err,
     };
 
+    // Install signal handlers BEFORE any cloud mutation (Neon branch) or child
+    // spawn. The handler only sets `should_stop`; default disposition would kill
+    // the process without running the teardown defers below (orphaning the
+    // branch / children). After each mutation we re-check `should_stop` and
+    // return through the defers if interrupted.
+    installSignalHandlers();
+
     // ── optional ephemeral Neon branch ───────────────────────────────────
     var branch: ?neon.Branch = null;
     var neon_pid: ?[]u8 = null; // owned; kept alive for the teardown defer
@@ -76,7 +83,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         }
         if (neon_pid) |pid| gpa.free(pid);
     }
-    if (opts.neon_branch) {
+    if (opts.neon_branch and !should_stop.load(.acquire)) {
         const project_id = opts.neon_project orelse env.get("NEON_PROJECT_ID") orelse {
             say("akm dev: --neon-branch needs --neon-project ID (or NEON_PROJECT_ID).\n");
             return error.MissingNeonProject;
@@ -97,6 +104,9 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         // have no revisions yet, which is not an error worth aborting for).
         migrate(gpa, io, opts.dir, &env);
     }
+    // Interrupted during branch creation/migration → return through the defer
+    // above, which deletes the branch (no orphan).
+    if (should_stop.load(.acquire)) return;
 
     // ── ensure a signing key shared by minter and backend ─────────────────
     const jwt_key = blk: {
@@ -108,6 +118,12 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         say("akm dev: generated an ephemeral AKM_INTERNAL_JWT_KEY for this session.\n");
         break :blk env.get("AKM_INTERNAL_JWT_KEY").?;
     };
+    // The proxy runs detached handler threads that may briefly outlive this
+    // function (bounded drain in proxy.run) and read cfg.minter.key. The slice
+    // above borrows from `env`, which `defer env.deinit()` frees on unwind — so
+    // copy the key into process-lifetime memory (page_allocator, never freed;
+    // reclaimed at exit) to rule out any use-after-free on shutdown.
+    const jwt_key_owned = try std.heap.page_allocator.dupe(u8, jwt_key);
 
     // Mark this as a dev run so the backend may start without a database
     // (`akm dev` without --neon-branch / a DATABASE_URL in .dev.vars). In
@@ -129,14 +145,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     };
     const vite_argv = [_][]const u8{ "npm", "run", "dev", "--", "--port", vp, "--strictPort" };
 
-    // Install the signal handler BEFORE spawning children. Otherwise a Ctrl-C in
-    // the window between spawn and handler-install hits the default disposition,
-    // kills the parent without running `defer shutdownChildren`, and orphans the
-    // (separate-process-group) uvicorn/Vite. The handler only sets `should_stop`;
-    // if it fires before the proxy starts, proxy.run returns at once and the
-    // defer below tears the children down.
-    installSignalHandlers();
-
+    // (Signal handlers were installed above, before the Neon branch / spawn.)
     var backend = spawnChild(io, opts.dir, &env, &backend_argv) catch |err| {
         say2("akm dev: failed to start uvicorn (is `uv` installed?): ", @errorName(err));
         say("\n");
@@ -159,7 +168,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         .proxy_port = opts.proxy_port,
         .backend_port = opts.backend_port,
         .vite_port = opts.vite_port,
-        .minter = .{ .key = jwt_key },
+        .minter = .{ .key = jwt_key_owned },
         .dev_user = opts.dev_user,
     };
     proxy.run(io, cfg, &should_stop) catch |err| {

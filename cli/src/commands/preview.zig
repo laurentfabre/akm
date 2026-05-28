@@ -91,7 +91,7 @@ fn create(
         var br = try neon.ensure(gpa, io, neon_project, branch);
         defer br.deinit();
         // Secrets = base file (AKM key + CF_ACCESS) + this PR branch's DB URLs.
-        try pushSecrets(gpa, io, opts, worker, br);
+        try pushSecrets(gpa, io, proj, opts, worker, br);
     }
 
     // 3. Deploy the named per-PR Worker (validated, not shipped, under --dry-run).
@@ -137,14 +137,16 @@ fn destroy(
 }
 
 /// Upload base secrets + the PR branch DB URLs via `wrangler secret bulk --name`.
-fn pushSecrets(gpa: std.mem.Allocator, io: std.Io, opts: Options, worker: []const u8, br: neon.Branch) !void {
+fn pushSecrets(gpa: std.mem.Allocator, io: std.Io, proj: std.Io.Dir, opts: Options, worker: []const u8, br: neon.Branch) !void {
     var bytes: ?[]u8 = null;
     defer if (bytes) |b| gpa.free(b);
     var vars: []project.Var = &.{};
     defer if (vars.len > 0) gpa.free(vars);
     if (opts.secrets_file) |sf| {
-        bytes = std.Io.Dir.cwd().readFileAlloc(io, sf, gpa, .limited(1 << 20)) catch {
-            say2("akm preview: cannot read secrets file '", sf);
+        // Resolve --secrets against the PROJECT dir, not the caller's cwd (see
+        // the same fix in deploy.zig). Absolute paths still work.
+        bytes = proj.readFileAlloc(io, sf, gpa, .limited(1 << 20)) catch {
+            say2("akm preview: cannot read secrets file (relative to the project dir) '", sf);
             say("'\n");
             return error.SecretsFile;
         };

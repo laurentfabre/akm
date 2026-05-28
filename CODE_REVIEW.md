@@ -37,6 +37,15 @@ Tests: 53 unit (＋6) green; e2e 52/52; dev-smoke 10/10.
 - **R2-m3 (MINOR, latent)** render `skipBlock` only tracked one block kind → cross-kind mis-nesting in a skipped branch went unreported. ✅ LIFO stack across all kinds.
 Round-2 audit otherwise verified every round-1 fix present and correct. Tests: 54 unit green.
 
+## Round 3 (re-audit) — auth SHIP/clean; core+cmds edge cases, all fixed
+- **R3-1 (MAJOR)** proxy shutdown UAF not fully closed by the 1s drain (a withholding client outlasts it, then reads freed `cfg.minter.key`). ✅ key copied into process-lifetime memory (page_allocator, never freed) so handlers can't read freed bytes; drain kept as courtesy.
+- **R3-2 (MAJOR)** proxy `Content-Length` via `parseInt` accepted `+5`/`-0` (parser differential). ✅ require `1*DIGIT` (`isAllDigits`) before parse.
+- **R3-3 (MAJOR)** `--secrets FILE` read from cwd, not the project dir → wrong DB/secrets when `dir != "."`. ✅ deploy.zig + preview.zig read it via the project Dir (absolute paths still work).
+- **R3-4 (MAJOR)** dev `--neon-branch`: signal handler installed after branch creation → Ctrl-C orphaned the branch. ✅ install handler before any cloud mutation + `should_stop` check after branch/migrate (returns through the delete defer).
+- **R3-5 (MAJOR)** p0-deploy `FORCE_PRODVARS` rewrite kept an existing file's mode (umask only affects new files) → world-readable secrets. ✅ explicit `chmod 600`.
+- **R3-6 (MINOR)** proxy head bounded by count, not bytes. ✅ aggregate 64KiB request-head cap.
+Round-3 auth verdict: SHIP, fully clean. Tests after fixes: 54 unit green.
+
 ## MINOR (FIX cheap ones)
 - **N1 `.dev.vars` NUL → panic** (project.zig parseVars) — invalid key/value bytes panic `Environ.Map.put`. Validate keys, reject NUL, error with line number.
 - **N2 Dockerfile runs as root** — add a non-root `USER` before `CMD`.

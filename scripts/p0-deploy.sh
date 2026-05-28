@@ -115,6 +115,9 @@ DATABASE_URL_DIRECT="$DIRECT"
 CF_ACCESS_TEAM_DOMAIN="${CF_ACCESS_TEAM_DOMAIN:-CHANGEME-your-team}"
 CF_ACCESS_AUD="${CF_ACCESS_AUD:-CHANGEME-access-app-aud-tag}"
 EOF
+  # `umask` only affects NEW files; on a FORCE_PRODVARS rewrite of an existing
+  # file, `cat >` keeps its old (possibly 0644) mode — so set it explicitly.
+  chmod 600 .prod.vars
   ok "wrote .prod.vars (mode 600)"
 fi
 if grep -q CHANGEME .prod.vars 2>/dev/null; then
