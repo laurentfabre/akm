@@ -48,14 +48,15 @@ to_psycopg() {
   printf '%s' "$u"
 }
 
-# ── 0. preflight (tools that every path needs) ──────────────────────────────
+# ── 0. preflight (tools needed by EVERY path, incl. DRY_RUN_ONLY) ───────────
 step "Preflight"
 if [ ! -x "$AKM_BIN" ]; then
   have akm || die "akm not found at '$AKM_BIN' (build: cd cli && zig build), or set AKM_BIN"
   AKM_BIN="$(command -v akm)"
 fi
-for t in neonctl npm uv node python3 openssl; do have "$t" || die "missing required tool: $t"; done
-ok "tools present; akm = $AKM_BIN"
+# `akm deploy --dry-run` (the DRY_RUN_ONLY path) needs the build toolchain only.
+for t in npm uv node; do have "$t" || die "missing required tool: $t"; done
+ok "build tools present; akm = $AKM_BIN"
 
 # ── 1. scaffold (only if absent) ────────────────────────────────────────────
 step "Scaffold project"
@@ -82,6 +83,10 @@ if [ "$DRY_RUN_ONLY" = 1 ]; then
   ok "dry-run passed"
   step "Done (DRY_RUN_ONLY=1)"; exit 0
 fi
+
+# Tools only the REAL path needs (Neon branch + .prod.vars) — checked after the
+# dry-run gate so validate-only runs don't require tools they never use.
+for t in neonctl python3 openssl; do have "$t" || die "missing required tool: $t"; done
 
 # ── 3. ensure a dedicated Neon spike branch + fetch connection strings ──────
 step "Neon branch '$NEON_BRANCH' on project $NEON_PROJECT"

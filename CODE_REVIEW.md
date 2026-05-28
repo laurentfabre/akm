@@ -63,6 +63,12 @@ Round-4 auth verdict: SHIP, clean. Tests after fixes: 55 unit green.
 - **R5-4 (MINOR)** p0-deploy rewrite had a brief mode window. ✅ mktemp (0600) + atomic mv.
 Round-5 verdict: auth SHIP, cmds SHIP, core SHIP-with-fixes (no BLOCKER). Tests after fixes: 55 unit / 52 e2e / 10 dev-smoke.
 
+## Round 6 (re-audit) — ALL THREE components SHIP (no BLOCKER/MAJOR). 3 MINORs fixed.
+- **R6-1 (MINOR)** proxy `Connection` used substring match (`notupgrade` counted as upgrade). ✅ `hasToken` (whole comma-token match); also reject an upgrade request that carries a body.
+- **R6-2 (MINOR)** preview `--dry-run` still required `--neon-project` though it never touches Neon. ✅ resolve the project id lazily; only the real (cloud) paths require it.
+- **R6-3 (MINOR)** p0-deploy preflight required Neon-only tools (`neonctl`/`python3`/`openssl`) even for `DRY_RUN_ONLY`. ✅ check build tools up front; Neon tools only after the dry-run gate.
+Round-6 verdict: auth SHIP, core SHIP, cmds SHIP. Tests after fixes: 56 unit / 52 e2e / 10 dev-smoke.
+
 ## MINOR (FIX cheap ones)
 - **N1 `.dev.vars` NUL → panic** (project.zig parseVars) — invalid key/value bytes panic `Environ.Map.put`. Validate keys, reject NUL, error with line number.
 - **N2 Dockerfile runs as root** — add a non-root `USER` before `CMD`.

@@ -145,6 +145,15 @@ const RequestHead = struct {
     is_upgrade: bool,
 };
 
+/// True iff `list` (a comma-separated header value like `keep-alive, Upgrade`)
+/// contains `tok` as a whole, case-insensitive token — not a substring (so
+/// `notupgrade` does NOT match `upgrade`).
+fn hasToken(list: []const u8, tok: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |raw| if (eqlIc(std.mem.trim(u8, raw, " \t"), tok)) return true;
+    return false;
+}
+
 /// True iff `s` is non-empty and all ASCII digits (a valid HTTP token like
 /// Content-Length: 1*DIGIT). Rejects empty, signs (`+5`/`-0`), and stray bytes.
 fn isAllDigits(s: []const u8) bool {
@@ -201,8 +210,11 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
             if (has_te) return error.BadRequest; // multiple Transfer-Encoding headers
             has_te = true;
             chunked = eqlIc(value, "chunked");
-        } else if (eqlIc(name, "connection") and containsIc(value, "upgrade")) {
-            conn_upgrade = true;
+        } else if (eqlIc(name, "connection")) {
+            // Token-match, not substring: `Connection: notupgrade` must NOT count
+            // as an upgrade (it would skip request-body forwarding and can pin a
+            // handler against a body-reading upstream).
+            if (hasToken(value, "upgrade")) conn_upgrade = true;
         } else if (eqlIc(name, "upgrade")) {
             has_upgrade = true;
         }
@@ -216,6 +228,10 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
     // proxy doesn't understand (e.g. `gzip`, or chunked-not-final) would be
     // forwarded with no body and can deadlock a close-delimited upstream — reject.
     if (has_te and !chunked) return error.BadRequest;
+    // An upgrade request carrying a body is ambiguous (we forward no body on
+    // upgrade); reject rather than risk a framing desync.
+    const is_upgrade = has_upgrade and conn_upgrade;
+    if (is_upgrade and (content_length != null or has_te)) return error.BadRequest;
 
     return .{
         .request_line = request_line,
@@ -224,7 +240,7 @@ fn parseRequestHead(a: std.mem.Allocator, r: *std.Io.Reader) !RequestHead {
         .headers = try headers.toOwnedSlice(a),
         .content_length = content_length,
         .chunked = chunked,
-        .is_upgrade = has_upgrade and conn_upgrade,
+        .is_upgrade = is_upgrade,
     };
 }
 
@@ -491,6 +507,13 @@ test "header helpers are case-insensitive" {
     try testing.expect(!containsIc("keep-alive", "upgrade"));
 }
 
+test "hasToken matches whole comma tokens, not substrings" {
+    try testing.expect(hasToken("Upgrade", "upgrade"));
+    try testing.expect(hasToken("keep-alive, Upgrade", "upgrade"));
+    try testing.expect(!hasToken("notupgrade", "upgrade")); // substring must not match
+    try testing.expect(!hasToken("upgraded", "upgrade"));
+}
+
 test "trimCrlf strips line endings only on the right" {
     try testing.expectEqualStrings("a: b", trimCrlf("a: b\r\n"));
     try testing.expectEqualStrings("", trimCrlf("\r\n"));
@@ -522,6 +545,11 @@ test "parseRequestHead: Content-Length parsed; chunked detected; upgrade detecte
     try testing.expect(ch.chunked);
     const up = try parseHeadTest(a, "GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
     try testing.expect(up.is_upgrade);
+    // `Connection: notupgrade` is NOT an upgrade (token match, not substring)
+    const nu = try parseHeadTest(a, "GET / HTTP/1.1\r\nConnection: notupgrade\r\nUpgrade: websocket\r\n\r\n");
+    try testing.expect(!nu.is_upgrade);
+    // an upgrade request carrying a body is rejected (ambiguous framing)
+    try testing.expectError(error.BadRequest, parseHeadTest(a, "GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 5\r\n\r\n"));
 }
 
 test "parseRequestHead: rejects malformed/smuggling/oversized heads" {

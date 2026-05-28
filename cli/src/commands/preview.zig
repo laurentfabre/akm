@@ -49,15 +49,22 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     const branch = try std.fmt.allocPrint(gpa, "akm-pr-{s}", .{opts.pr});
     defer gpa.free(branch);
 
-    const neon_project = opts.neon_project orelse main.environ_map.get("NEON_PROJECT_ID") orelse {
-        say("akm preview: needs --neon-project ID (or NEON_PROJECT_ID).\n");
-        return error.MissingNeonProject;
-    };
+    // Resolve lazily — a `--dry-run` create/destroy never touches Neon, so it
+    // must not require a project id. Each cloud path requires it where used.
+    const neon_project = opts.neon_project orelse main.environ_map.get("NEON_PROJECT_ID");
 
     switch (opts.action) {
         .create => try create(gpa, io, proj, opts, worker, branch, neon_project),
         .destroy => try destroy(gpa, io, opts, worker, branch, neon_project),
     }
+}
+
+/// Require a Neon project id (only the real, cloud-touching paths need one).
+fn requireNeonProject(neon_project: ?[]const u8) ![]const u8 {
+    return neon_project orelse {
+        say("akm preview: needs --neon-project ID (or NEON_PROJECT_ID).\n");
+        return error.MissingNeonProject;
+    };
 }
 
 fn create(
@@ -67,7 +74,7 @@ fn create(
     opts: Options,
     worker: []const u8,
     branch: []const u8,
-    neon_project: []const u8,
+    neon_project: ?[]const u8,
 ) !void {
     say2("akm preview: creating preview for PR #", opts.pr);
     say("\n");
@@ -86,9 +93,10 @@ fn create(
         say2("akm preview: --dry-run — would ensure Neon branch ", branch);
         say(" and upload secrets (skipped)\n");
     } else {
+        const np = try requireNeonProject(neon_project);
         say2("akm preview: ensuring Neon branch ", branch);
         say(" …\n");
-        var br = try neon.ensure(gpa, io, neon_project, branch);
+        var br = try neon.ensure(gpa, io, np, branch);
         defer br.deinit();
         // Secrets = base file (AKM key + CF_ACCESS) + this PR branch's DB URLs.
         try pushSecrets(gpa, io, proj, opts, worker, br);
@@ -115,7 +123,7 @@ fn destroy(
     opts: Options,
     worker: []const u8,
     branch: []const u8,
-    neon_project: []const u8,
+    neon_project: ?[]const u8,
 ) !void {
     say2("akm preview: destroying preview for PR #", opts.pr);
     say("\n");
@@ -127,12 +135,13 @@ fn destroy(
         say(" (no changes made)\n");
         return;
     }
+    const np = try requireNeonProject(neon_project);
     // Best-effort: tear down the Worker, then the branch, regardless of order outcome.
     wrangler(gpa, io, opts.dir, &.{ "delete", "--name", worker }, false) catch
         say("akm preview: wrangler delete failed (already gone?) — continuing\n");
     say2("akm preview: deleting Neon branch ", branch);
     say(" …\n");
-    neon.delete(gpa, io, neon_project, branch);
+    neon.delete(gpa, io, np, branch);
     say("akm preview: done.\n");
 }
 
